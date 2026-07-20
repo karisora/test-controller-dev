@@ -1,0 +1,17 @@
+# Dependencies
+/node_modules/
+
+# Next.js build output
+/.next/
+/out/
+
+# Local environment files
+.env*
+!.env.example
+
+# Logs and OS metadata
+*.log
+.DS_Store
+
+# TypeScript build cache
+*.tsbuildinfo

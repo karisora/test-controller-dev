@@ -2,15 +2,15 @@
 
 import { FormEvent, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
-type SerialPortLike = {
+type SerialPortLike = EventTarget & {
   readable: ReadableStream<Uint8Array> | null;
   writable: WritableStream<Uint8Array> | null;
-  open(options: { baudRate: number }): Promise<void>;
+  open(options: { baudRate: number; bufferSize?: number }): Promise<void>;
   close(): Promise<void>;
 };
 
 type SerialNavigator = Navigator & {
-  serial?: {
+  serial?: EventTarget & {
     requestPort(): Promise<SerialPortLike>;
   };
 };
@@ -69,6 +69,19 @@ export default function Home() {
   }, []);
 
   const disconnect = useCallback(async () => {
+    const writer = writerRef.current;
+    if (writer) {
+      try {
+        await writer.write(
+          new TextEncoder().encode(`${MOTOR_IDS[0]},0\n${MOTOR_IDS[1]},0\n`),
+        );
+        addLog("tx", `${MOTOR_IDS[0]},0`);
+        addLog("tx", `${MOTOR_IDS[1]},0`);
+      } catch {
+        addLog("error", "切断前の停止コマンドを送信できませんでした");
+      }
+    }
+
     const reader = readerRef.current;
     readerRef.current = null;
     if (reader) {
@@ -126,12 +139,14 @@ export default function Home() {
       if (!serial) throw new Error("Web Serial APIが利用できません");
 
       const port = await serial.requestPort();
-      await port.open({ baudRate: 115200 });
+      await port.open({ baudRate: 115200, bufferSize: 4096 });
+      portRef.current = port;
       if (!port.readable || !port.writable) {
+        await port.close();
+        portRef.current = null;
         throw new Error("ポートの読み書きを開始できませんでした");
       }
 
-      portRef.current = port;
       writerRef.current = port.writable.getWriter();
       const reader = port.readable.getReader();
       readerRef.current = reader;
@@ -230,11 +245,20 @@ export default function Home() {
   async function submitRawCommand(event: FormEvent) {
     event.preventDefault();
     const command = rawCommand.trim();
-    if (!/^0x10[01]\s*,\s*-?\d+$/i.test(command)) {
+    const match = command.match(/^(0x10[01])\s*,\s*(-?\d+)$/i);
+    if (!match) {
       addLog("error", "形式は 0x100,800 または 0x101,-800 です");
       return;
     }
-    if (await sendCommand(command)) setRawCommand("");
+
+    const speed = Number(match[2]);
+    if (!Number.isSafeInteger(speed) || Math.abs(speed) > MAX_SPEED) {
+      addLog("error", `速度は -${MAX_SPEED.toLocaleString()}〜${MAX_SPEED.toLocaleString()} の整数で指定してください`);
+      return;
+    }
+
+    const normalizedCommand = `${match[1].toLowerCase()},${speed}`;
+    if (await sendCommand(normalizedCommand)) setRawCommand("");
   }
 
   return (
@@ -244,9 +268,9 @@ export default function Home() {
           <span className="brandMark" aria-hidden="true"><i /><i /><i /></span>
           <span>PICO STEPPER <b>CONSOLE</b></span>
         </a>
-        <div className={`connectionPill ${connected ? "isConnected" : ""}`}>
-          <span className="statusDot" />
-          {connected ? "接続中" : "未接続"}
+        <div className={`connectionPill ${connected ? "isConnected" : ""}`} role="status" aria-live="polite">
+          <span className="statusDot" aria-hidden="true" />
+          {connecting ? "接続処理中" : connected ? "接続中" : "未接続"}
         </div>
       </header>
 
@@ -275,7 +299,6 @@ export default function Home() {
                 onClick={connected ? disconnect : connect}
                 disabled={connecting || supported === null}
               >
-                <span aria-hidden="true">{connected ? "×" : "↗"}</span>
                 {connecting ? "接続しています…" : connected ? "USBを切断" : "USBポートを選択"}
               </button>
               <small>通信速度 115200 baud ・ データは端末内で処理されます</small>
@@ -288,7 +311,7 @@ export default function Home() {
         <div className="sectionHeading">
           <div><span>CONTROL DECK</span><h2>モーター動作確認</h2></div>
           <button className="emergency" onClick={emergencyStop} disabled={!connected}>
-            <span aria-hidden="true">■</span> すべて停止
+            すべて停止
           </button>
         </div>
 
@@ -301,7 +324,7 @@ export default function Home() {
               </div>
 
               <div className={`motorStatus ${motor.running ? "running" : ""}`}>
-                <span className="motorIcon" aria-hidden="true">◎</span>
+                <span className="motorIcon" aria-hidden="true" />
                 <div><b>{motor.running ? "RUNNING" : "STANDBY"}</b><small>{motor.running ? `${motor.direction > 0 ? "正転" : "逆転"} / ${motor.speed.toLocaleString()} steps/s` : "停止中"}</small></div>
               </div>
 
@@ -313,6 +336,7 @@ export default function Home() {
                   min="1"
                   max={MAX_SPEED}
                   value={motor.speed}
+                  disabled={motor.running}
                   onChange={(event) => updateMotor(index, { speed: Math.min(MAX_SPEED, Math.max(1, Number(event.target.value) || 1)) })}
                 />
                 <span>steps/s</span>
@@ -325,19 +349,20 @@ export default function Home() {
                 max={MAX_SPEED}
                 step="1"
                 value={motor.speed}
+                disabled={motor.running}
                 onChange={(event) => updateMotor(index, { speed: Number(event.target.value) })}
               />
               <div className="rangeLabels"><span>1</span><span>20,000</span></div>
 
               <span className="fieldLabel">回転方向 <span>DIRECTION</span></span>
               <div className="directionGroup" role="group" aria-label={`モーター${index + 1}の回転方向`}>
-                <button className={motor.direction === 1 ? "active" : ""} onClick={() => updateMotor(index, { direction: 1 })}>↻ 正転</button>
-                <button className={motor.direction === -1 ? "active" : ""} onClick={() => updateMotor(index, { direction: -1 })}>↺ 逆転</button>
+                <button className={motor.direction === 1 ? "active" : ""} onClick={() => updateMotor(index, { direction: 1 })} disabled={motor.running}>正転</button>
+                <button className={motor.direction === -1 ? "active" : ""} onClick={() => updateMotor(index, { direction: -1 })} disabled={motor.running}>逆転</button>
               </div>
 
               <div className="motorActions">
-                <button className="button run" onClick={() => runMotor(index)} disabled={!connected}>▶ 動作開始</button>
-                <button className="button stop" onClick={() => stopMotor(index)} disabled={!connected}>■ 停止</button>
+                <button className="button run" onClick={() => runMotor(index)} disabled={!connected}>動作開始</button>
+                <button className="button stop" onClick={() => stopMotor(index)} disabled={!connected}>停止</button>
               </div>
             </article>
           ))}
@@ -363,7 +388,7 @@ export default function Home() {
         <form className="rawCommand" onSubmit={submitRawCommand}>
           <label htmlFor="raw">RAW COMMAND</label>
           <input id="raw" value={rawCommand} onChange={(event) => setRawCommand(event.target.value)} placeholder="0x100,800" />
-          <button type="submit" disabled={!connected}>送信 ↵</button>
+          <button type="submit" disabled={!connected}>送信</button>
         </form>
       </section>
 

@@ -8,16 +8,18 @@
   --green-dark: #78a400;
   --orange: #ff5b35;
   --navy: #101b1a;
-  --font-sans: "Hiragino Sans", "Yu Gothic UI", "Yu Gothic", system-ui, sans-serif;
-  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --font-sans: var(--font-noto-sans-jp), "Hiragino Sans", system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), "SFMono-Regular", Consolas, monospace;
 }
 
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; background: var(--paper); }
+.bg-background { background: var(--paper); }
 body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--font-sans), sans-serif; }
 button, input { font: inherit; }
 button { cursor: pointer; }
-button:disabled { cursor: not-allowed; opacity: .45; }
+button:disabled, input:disabled { cursor: not-allowed; opacity: .45; }
+button:focus-visible, input:focus-visible, a:focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
 
 .topbar { height: 72px; padding: 0 clamp(20px, 5vw, 76px); border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; background: rgba(244,242,234,.9); backdrop-filter: blur(16px); position: sticky; top: 0; z-index: 20; }
 .brand { display: flex; align-items: center; gap: 12px; color: var(--ink); text-decoration: none; font: 600 13px/1 var(--font-mono), monospace; letter-spacing: .08em; }
@@ -66,8 +68,8 @@ h1 em { color: transparent; -webkit-text-stroke: 1.5px var(--ink); font-style: n
 .motorHeader code { background: var(--paper); padding: 8px 11px; font: 500 12px var(--font-mono), monospace; }
 .motorStatus { margin: 28px 0 31px; background: #f4f5f1; padding: 17px 19px; display: flex; align-items: center; gap: 15px; border-left: 3px solid #b6bcb8; }
 .motorStatus.running { background: #f4fadf; border-color: var(--green-dark); }
-.motorIcon { font-size: 29px; color: #8e9793; }
-.running .motorIcon { color: var(--green-dark); animation: spin 1.2s linear infinite; }
+.motorIcon { width: 28px; height: 28px; flex: 0 0 auto; border: 4px dotted #8e9793; border-radius: 50%; }
+.running .motorIcon { border-color: var(--green-dark); animation: spin 1.2s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .motorStatus b { display: block; font: 600 12px var(--font-mono), monospace; letter-spacing: .1em; }
 .motorStatus small { color: var(--muted); font-size: 11px; }

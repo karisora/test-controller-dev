@@ -5,6 +5,7 @@
 #include "mdns_responder.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "pico/unique_id.h"
 #include "socket.h"
 #include "wizchip_conf.h"
 #include "W5500/w5500.h"
@@ -60,7 +61,7 @@
 #define MOTOR_API_KEY ""
 #endif
 #ifndef MOTOR_API_WATCHDOG_MS
-#define MOTOR_API_WATCHDOG_MS 10000u
+#define MOTOR_API_WATCHDOG_MS 1000u
 #endif
 #ifndef MAX_SPEED_STEPS_PER_SEC
 #define MAX_SPEED_STEPS_PER_SEC 20000
@@ -71,9 +72,10 @@
 #define HTTP_PORT 80
 #define DHCP_BUFFER_SIZE 1024u
 #define DHCP_STARTUP_TIMEOUT_US 15000000u
-#define REQUEST_BUFFER_SIZE 1024u
-#define RESPONSE_BUFFER_SIZE 768u
+#define REQUEST_BUFFER_SIZE 2048u
+#define RESPONSE_BUFFER_SIZE 2048u
 #define REQUEST_TIMEOUT_US 2000000u
+#define PHY_LINK_CHECK_INTERVAL_US 1000u
 #define MOTOR1_ID 0x100u
 #define MOTOR2_ID 0x101u
 
@@ -84,12 +86,21 @@ static size_t request_length;
 static uint64_t request_started_us;
 static uint8_t dhcp_buffer[DHCP_BUFFER_SIZE];
 static wiz_NetInfo current_network;
+static uint8_t device_mac[6] = {
+    MOTOR_MAC_OCTET_1, MOTOR_MAC_OCTET_2, MOTOR_MAC_OCTET_3,
+    MOTOR_MAC_OCTET_4, MOTOR_MAC_OCTET_5, MOTOR_MAC_OCTET_6,
+};
 static char current_ip_address[16] = "0.0.0.0";
 static bool dhcp_enabled;
 static bool dhcp_address_ready;
 static bool mdns_started;
 static bool dhcp_timer_started;
 static struct repeating_timer dhcp_timer;
+static bool phy_link_up;
+static bool phy_link_initialized;
+static uint64_t next_phy_link_check_us;
+
+static bool service_phy_link(void);
 
 static void chip_select(void)
 {
@@ -126,6 +137,24 @@ static void format_current_ip(void)
     snprintf(current_ip_address, sizeof(current_ip_address), "%u.%u.%u.%u",
              current_network.ip[0], current_network.ip[1],
              current_network.ip[2], current_network.ip[3]);
+}
+
+static void configure_unique_mac(void)
+{
+    pico_unique_board_id_t board_id;
+    pico_get_unique_board_id(&board_id);
+
+    // ローカル管理・ユニキャストMAC。複数台を同じLANへ接続しても衝突しない
+    // よう、Pico固有IDの全バイトを末尾5バイトへ畳み込む。
+    device_mac[0] = 0x02;
+    device_mac[1] = 0x50;
+    device_mac[2] = 0x49;
+    device_mac[3] = 0x43;
+    device_mac[4] = 0x4f;
+    device_mac[5] = 0;
+    for (size_t i = 0; i < PICO_UNIQUE_BOARD_ID_SIZE_BYTES; ++i) {
+        device_mac[1 + i % 5] ^= board_id.id[i];
+    }
 }
 
 static void dhcp_address_callback(void)
@@ -165,14 +194,13 @@ static bool apply_dhcp_address(void)
 static void configure_link_local(void)
 {
     wiz_NetInfo fallback = {
-        .mac = {MOTOR_MAC_OCTET_1, MOTOR_MAC_OCTET_2, MOTOR_MAC_OCTET_3,
-                MOTOR_MAC_OCTET_4, MOTOR_MAC_OCTET_5, MOTOR_MAC_OCTET_6},
         .ip = {169, 254, 50, 50},
         .sn = {255, 255, 0, 0},
         .gw = {0, 0, 0, 0},
         .dns = {0, 0, 0, 0},
         .dhcp = NETINFO_STATIC,
     };
+    memcpy(fallback.mac, device_mac, sizeof(fallback.mac));
     current_network = fallback;
     ctlnetwork(CN_SET_NETINFO, &current_network);
     format_current_ip();
@@ -186,15 +214,24 @@ static bool dhcp_timer_callback(struct repeating_timer *timer)
     return true;
 }
 
+static void stop_dhcp_client(void)
+{
+    if (dhcp_enabled) {
+        DHCP_stop();
+        dhcp_enabled = false;
+    }
+    if (dhcp_timer_started) {
+        cancel_repeating_timer(&dhcp_timer);
+        dhcp_timer_started = false;
+    }
+    dhcp_address_ready = false;
+}
+
 static bool acquire_network_address(void)
 {
+    stop_dhcp_client();
     memset(&current_network, 0, sizeof(current_network));
-    current_network.mac[0] = MOTOR_MAC_OCTET_1;
-    current_network.mac[1] = MOTOR_MAC_OCTET_2;
-    current_network.mac[2] = MOTOR_MAC_OCTET_3;
-    current_network.mac[3] = MOTOR_MAC_OCTET_4;
-    current_network.mac[4] = MOTOR_MAC_OCTET_5;
-    current_network.mac[5] = MOTOR_MAC_OCTET_6;
+    memcpy(current_network.mac, device_mac, sizeof(current_network.mac));
     current_network.dhcp = NETINFO_DHCP;
     setSHAR(current_network.mac);
 
@@ -215,6 +252,11 @@ static bool acquire_network_address(void)
     uint64_t deadline = time_us_64() + DHCP_STARTUP_TIMEOUT_US;
 
     while (time_us_64() < deadline) {
+        uint8_t link_status = PHY_LINK_OFF;
+        if (ctlwizchip(CW_GET_PHYLINK, &link_status) == 0 &&
+            link_status != PHY_LINK_ON) {
+            break;
+        }
         uint8_t result = DHCP_run();
         if (dhcp_address_ready || result == DHCP_IP_LEASED) {
             if (apply_dhcp_address()) {
@@ -225,11 +267,7 @@ static bool acquire_network_address(void)
         sleep_ms(10);
     }
 
-    DHCP_stop();
-    if (dhcp_timer_started) {
-        cancel_repeating_timer(&dhcp_timer);
-        dhcp_timer_started = false;
-    }
+    stop_dhcp_client();
     configure_link_local();
     printf("DHCP unavailable; using link-local %s\r\n", current_ip_address);
     return true;
@@ -360,12 +398,69 @@ static void send_json(int status, const char *status_text, const char *json)
         "Cache-Control: no-store\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, X-API-Key\r\n"
+        "Access-Control-Allow-Headers: Content-Type, X-API-Key, Accept\r\n"
         "Access-Control-Allow-Private-Network: true\r\n"
+        "Access-Control-Max-Age: 600\r\n"
         "Connection: close\r\n\r\n%s",
         status, status_text, body_length, json);
     if (length > 0 && (size_t)length < sizeof(response)) {
         send(HTTP_SOCKET, (uint8_t *)response, (uint16_t)length);
+    }
+}
+
+static void send_control_page(void)
+{
+    static const char page[] =
+        "<!doctype html><html lang=\"ja\"><head>"
+        "<meta charset=\"utf-8\"><meta name=\"viewport\" "
+        "content=\"width=device-width,initial-scale=1\">"
+        "<title>Pico Motor</title><style>"
+        "body{font:16px sans-serif;max-width:560px;margin:30px auto;padding:16px}"
+        ".motor{padding:16px;margin:12px 0;border:1px solid #bbb;border-radius:8px}"
+        "input{width:130px;padding:8px}button{padding:9px;margin:4px}"
+        "pre{white-space:pre-wrap;background:#eee;padding:12px}</style></head>"
+        "<body><h1>W5500 Motor API</h1>"
+        "<div class=\"motor\">Motor 1 <input id=\"s1\" type=\"number\" "
+        "min=\"-20000\" max=\"20000\" value=\"800\">"
+        "<button onclick=\"run(1)\">送信</button>"
+        "<button onclick=\"halt(1)\">停止</button></div>"
+        "<div class=\"motor\">Motor 2 <input id=\"s2\" type=\"number\" "
+        "min=\"-20000\" max=\"20000\" value=\"800\">"
+        "<button onclick=\"run(2)\">送信</button>"
+        "<button onclick=\"halt(2)\">停止</button></div>"
+        "<button onclick=\"stopAll()\">すべて停止</button>"
+        "<button onclick=\"status()\">状態更新</button><pre id=\"out\">接続中...</pre>"
+        "<script>"
+        "const out=document.getElementById('out'),timers={};let pending=Promise.resolve();"
+        "async function request(url,opt){try{let r=await fetch(url,opt);"
+        "let t=await r.text();out.textContent='HTTP '+r.status+'\\n'+t;"
+        "if(!r.ok)throw Error(t);return t}catch(e){out.textContent='接続エラー: '+e;"
+        "throw e}}"
+        "function call(url,opt){pending=pending.catch(()=>{}).then(()=>request(url,opt));"
+        "return pending}"
+        "function setMotor(n,v){return call('/api/motors/'+n,{method:'PUT',"
+        "headers:{'Content-Type':'application/json'},body:JSON.stringify({speed:v})})}"
+        "function run(n){let send=()=>setMotor(n,Number(document.getElementById('s'+n).value));"
+        "clearInterval(timers[n]);send();timers[n]=setInterval(send,500)}"
+        "function halt(n){clearInterval(timers[n]);setMotor(n,0)}"
+        "function stopAll(){clearInterval(timers[1]);clearInterval(timers[2]);"
+        "call('/api/stop',{method:'POST'})}"
+        "function status(){call('/api/status')}"
+        "status();</script></body></html>";
+
+    int body_length = (int)strlen(page);
+    char header[192];
+    int header_length = snprintf(
+        header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n",
+        body_length);
+    if (header_length > 0 && (size_t)header_length < sizeof(header)) {
+        send(HTTP_SOCKET, (uint8_t *)header, (uint16_t)header_length);
+        send(HTTP_SOCKET, (uint8_t *)page, (uint16_t)body_length);
     }
 }
 
@@ -401,9 +496,18 @@ static void handle_request(char *request)
                   "{\"ok\":false,\"error\":\"invalid request\"}");
         return;
     }
+    char *query = strchr(path, '?');
+    if (query != NULL) {
+        *query = '\0';
+    }
 
     if (strcmp(method, "OPTIONS") == 0) {
         send_json(204, "No Content", "");
+        return;
+    }
+    if (strcmp(method, "GET") == 0 &&
+        (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0)) {
+        send_control_page();
         return;
     }
     if (!authorized(request)) {
@@ -413,7 +517,8 @@ static void handle_request(char *request)
     }
     if (strcmp(method, "GET") == 0 &&
         (strcmp(path, "/api/status") == 0 ||
-         strcmp(path, "/api/health") == 0)) {
+         strcmp(path, "/api/health") == 0 ||
+         strcmp(path, "/api") == 0)) {
         send_status();
         return;
     }
@@ -466,15 +571,67 @@ static void reset_request(void)
     request_buffer[0] = '\0';
 }
 
+static bool service_phy_link(void)
+{
+    uint64_t now = time_us_64();
+    if (phy_link_initialized && now < next_phy_link_check_us) {
+        return phy_link_up;
+    }
+    next_phy_link_check_us = now + PHY_LINK_CHECK_INTERVAL_US;
+
+    uint8_t link_status = PHY_LINK_OFF;
+    if (ctlwizchip(CW_GET_PHYLINK, &link_status) != 0) {
+        return phy_link_up;
+    }
+
+    bool link_is_up = link_status == PHY_LINK_ON;
+    if (!phy_link_initialized) {
+        phy_link_initialized = true;
+        phy_link_up = link_is_up;
+        return phy_link_up;
+    }
+    if (link_is_up == phy_link_up) {
+        return phy_link_up;
+    }
+
+    phy_link_up = link_is_up;
+    if (!phy_link_up) {
+        // PHYリンク断を検出した時点で、API制御中かどうかに関係なく停止する。
+        if (command_motor != NULL) {
+            command_motor(MOTOR1_ID, 0);
+            command_motor(MOTOR2_ID, 0);
+        }
+        close(HTTP_SOCKET);
+        reset_request();
+        stop_dhcp_client();
+        if (mdns_started) {
+            mdns_responder_stop();
+            mdns_started = false;
+        }
+        printf("LAN link lost: all motors stopped\r\n");
+        return false;
+    }
+
+    printf("LAN link restored\r\n");
+    close(HTTP_SOCKET);
+    reset_request();
+    acquire_network_address();
+    if (!mdns_started) {
+        mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
+    }
+    printf("Motor API: http://%s/ (http://" MOTOR_HOSTNAME ".local/)\r\n",
+           current_ip_address);
+    return true;
+}
+
 static void service_dhcp(void)
 {
     if (!dhcp_enabled) {
         return;
     }
 
-    uint8_t result = DHCP_run();
-    if (!dhcp_address_ready && result != DHCP_IP_ASSIGN &&
-        result != DHCP_IP_CHANGED && result != DHCP_IP_LEASED) {
+    DHCP_run();
+    if (!dhcp_address_ready) {
         return;
     }
 
@@ -495,6 +652,7 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
     command_motor = command_callback;
     read_motor_speed = status_callback;
     reset_request();
+    configure_unique_mac();
 
     gpio_init(W5500_CS_PIN);
     gpio_set_dir(W5500_CS_PIN, GPIO_OUT);
@@ -517,13 +675,27 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
     uint8_t tx_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
     uint8_t rx_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
     if (wizchip_init(tx_sizes, rx_sizes) != 0 || getVERSIONR() != 0x04) {
+        printf("W5500 communication failed\r\n");
         return false;
     }
 
-    acquire_network_address();
-    mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
+    phy_link_up = false;
+    phy_link_initialized = false;
+    next_phy_link_check_us = 0;
+    service_phy_link();
+    if (phy_link_up) {
+        acquire_network_address();
+    } else {
+        configure_link_local();
+        printf("LAN cable is not connected; DHCP will start when link is up\r\n");
+    }
+
+    printf("W5500 MAC %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+           device_mac[0], device_mac[1], device_mac[2],
+           device_mac[3], device_mac[4], device_mac[5]);
+    mdns_started = phy_link_up && mdns_responder_init(MOTOR_HOSTNAME);
     if (!mdns_started) {
-        printf("mDNS init failed; use http://%s instead\r\n",
+        printf("mDNS is not active; use http://%s/ after LAN link is up\r\n",
                current_ip_address);
     }
     return true;
@@ -531,6 +703,10 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
 
 void w5500_ethernet_service(void)
 {
+    if (!service_phy_link()) {
+        return;
+    }
+
     service_dhcp();
 
     uint8_t state = getSn_SR(HTTP_SOCKET);

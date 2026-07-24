@@ -36,7 +36,8 @@ type ApiStatus = {
 
 const MAX_SPEED = 20000;
 const DEFAULT_DEVICE = "pico-motor.local";
-const HEARTBEAT_MS = 3000;
+const HEARTBEAT_MS = 300;
+const API_TIMEOUT_MS = 8000;
 
 function nowLabel() {
   return new Intl.DateTimeFormat("ja-JP", {
@@ -49,7 +50,7 @@ function nowLabel() {
 
 function normalizeBaseUrl(value: string) {
   const trimmed = value.trim().replace(/\/+$/, "");
-  if (!trimmed) throw new Error("PicoのIPアドレスを入力してください");
+  if (!trimmed) throw new Error("Picoのホスト名またはIPアドレスを入力してください");
   const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
   const parsed = new URL(withProtocol);
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
@@ -141,12 +142,13 @@ export default function Home() {
       const run = async () => {
         const baseUrl = activeBaseUrlRef.current || normalizeBaseUrl(deviceAddress);
         const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), 2500);
+        const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
         try {
           const headers = new Headers(options.headers);
           if (options.body) headers.set("Content-Type", "application/json");
           if (apiKeyRef.current) headers.set("X-API-Key", apiKeyRef.current);
-          const response = await fetch(`${baseUrl}${path}`, {
+          const proxyPath = `/api/pico${path}?target=${encodeURIComponent(baseUrl)}`;
+          const response = await fetch(proxyPath, {
             ...options,
             headers,
             cache: "no-store",
@@ -160,7 +162,7 @@ export default function Home() {
           return status;
         } catch (error) {
           if (error instanceof DOMException && error.name === "AbortError") {
-            throw new Error("Picoから2.5秒以内に応答がありません");
+            throw new Error("Picoから8秒以内に応答がありません");
           }
           throw error;
         } finally {
@@ -487,7 +489,7 @@ export default function Home() {
       </section>
 
       <footer>
-        <p><b>安全機能</b> ブラウザからの更新が10秒間途絶えると、Picoがモーターを自動停止します。</p>
+        <p><b>安全機能</b> ブラウザからの更新が1秒間途絶えると、Picoがモーターを自動停止します。</p>
         <p>W5500 <span>•</span> DHCP <span>•</span> mDNS</p>
       </footer>
     </main>

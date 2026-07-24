@@ -17,13 +17,15 @@
 #define MOTOR1_ID 0x100u
 #define MOTOR2_ID 0x101u
 
+#ifndef MAX_SPEED_STEPS_PER_SEC
 #define MAX_SPEED_STEPS_PER_SEC 20000u
+#endif
 #define STEP_HIGH_US 2u
 #define DIR_SETUP_US 10u
 #define RX_LINE_SIZE 64u
 
 #ifndef MOTOR_API_WATCHDOG_MS
-#define MOTOR_API_WATCHDOG_MS 10000u
+#define MOTOR_API_WATCHDOG_MS 1000u
 #endif
 
 typedef struct {
@@ -68,10 +70,18 @@ static void set_motor_speed(stepper_t *motor, int32_t signed_speed,
         signed_speed = direction ? (int32_t)magnitude : -(int32_t)magnitude;
     }
 
+    uint64_t now = time_us_64();
+    if (motor->speed_steps_per_sec != 0 &&
+        motor->signed_speed == signed_speed) {
+        // 同じ速度の再送はパルスを途切れさせず、安全停止期限だけ更新する。
+        motor->stop_deadline_us =
+            timeout_ms == 0 ? 0 : now + (uint64_t)timeout_ms * 1000u;
+        return;
+    }
+
     gpio_put(motor->step_pin, 0);
     motor->step_is_high = false;
 
-    uint64_t now = time_us_64();
     gpio_put(motor->dir_pin, direction);
     gpio_put(motor->led_pin, 1);
     motor->signed_speed = signed_speed;
@@ -244,8 +254,8 @@ int main(void)
     bool ethernet_ready =
         w5500_ethernet_init(execute_api_command, read_api_motor_speed);
     if (ethernet_ready) {
-        printf("Motor API ready: http://%s/api/status "
-               "(http://" MOTOR_HOSTNAME ".local)\r\n",
+        printf("Open motor control page: http://%s/ "
+               "(http://" MOTOR_HOSTNAME ".local/)\r\n",
                w5500_ethernet_ip_address());
     } else {
         printf("W5500 init failed; USB control remains available\r\n");

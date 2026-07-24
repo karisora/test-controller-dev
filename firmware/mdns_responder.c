@@ -133,7 +133,8 @@ static bool decode_name_matches(const uint8_t *packet, size_t packet_length,
     return false;
 }
 
-static bool query_requests_our_address(const uint8_t *packet, size_t length)
+static bool query_requests_our_address(const uint8_t *packet, size_t length,
+                                       bool *unicast_requested)
 {
     if (length < 12) {
         return false;
@@ -154,10 +155,12 @@ static bool query_requests_our_address(const uint8_t *packet, size_t length)
         }
 
         uint16_t type = read_u16(packet + offset);
-        uint16_t query_class = read_u16(packet + offset + 2) & 0x7fffu;
+        uint16_t raw_class = read_u16(packet + offset + 2);
+        uint16_t query_class = raw_class & 0x7fffu;
         offset += 4;
 
         if (matches && (type == 1 || type == 255) && query_class == 1) {
+            *unicast_requested = (raw_class & 0x8000u) != 0;
             return true;
         }
     }
@@ -210,8 +213,9 @@ void mdns_responder_service(const uint8_t ip[4])
         available < sizeof(query) ? available : (uint16_t)sizeof(query);
     int32_t received =
         recvfrom(MDNS_SOCKET, query, receive_length, source_ip, &source_port);
-    if (received <= 0 ||
-        !query_requests_our_address(query, (size_t)received)) {
+    bool unicast_requested = false;
+    if (received <= 0 || !query_requests_our_address(
+                             query, (size_t)received, &unicast_requested)) {
         return;
     }
 
@@ -230,6 +234,10 @@ void mdns_responder_service(const uint8_t ip[4])
     memcpy(response + offset + 10, ip, 4);
     offset += 14;
 
+    uint8_t *destination_ip =
+        unicast_requested ? source_ip : multicast_ip;
+    uint16_t destination_port =
+        unicast_requested ? source_port : MDNS_PORT;
     sendto(MDNS_SOCKET, response, (uint16_t)offset,
-           (uint8_t *)multicast_ip, MDNS_PORT);
+           destination_ip, destination_port);
 }

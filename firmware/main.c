@@ -243,9 +243,13 @@ int main(void)
 
     bool ethernet_ready =
         w5500_ethernet_init(execute_api_command, read_api_motor_speed);
-    printf(ethernet_ready
-               ? "Motor API ready: http://" MOTOR_IP_ADDRESS "/api/status\r\n"
-               : "W5500 init failed; USB control remains available\r\n");
+    if (ethernet_ready) {
+        printf("Motor API ready: http://%s/api/status "
+               "(http://" MOTOR_HOSTNAME ".local)\r\n",
+               w5500_ethernet_ip_address());
+    } else {
+        printf("W5500 init failed; USB control remains available\r\n");
+    }
 
     while (true) {
         service_usb_input();

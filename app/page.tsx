@@ -25,6 +25,8 @@ type ApiMotor = {
 type ApiStatus = {
   ok: boolean;
   ip: string;
+  hostname?: string;
+  networkMode?: "dhcp" | "link-local";
   motors: ApiMotor[];
   maxSpeed: number;
   watchdogMs: number;
@@ -33,7 +35,7 @@ type ApiStatus = {
 };
 
 const MAX_SPEED = 20000;
-const DEFAULT_DEVICE = "192.168.1.50";
+const DEFAULT_DEVICE = "pico-motor.local";
 const HEARTBEAT_MS = 3000;
 
 function nowLabel() {
@@ -92,7 +94,9 @@ export default function Home() {
     const timer = window.setTimeout(() => {
       const savedAddress = window.localStorage.getItem("pico-device-address");
       const savedApiKey = window.localStorage.getItem("pico-api-key");
-      if (savedAddress) setDeviceAddress(savedAddress);
+      if (savedAddress && savedAddress !== "192.168.1.50") {
+        setDeviceAddress(savedAddress);
+      }
       if (savedApiKey) setApiKey(savedApiKey);
     }, 0);
     return () => window.clearTimeout(timer);
@@ -332,7 +336,7 @@ export default function Home() {
           <p className="heroCopy">
             W5500を接続したRaspberry Pi PicoへHTTP APIで命令を送り、
             2台のステップモーターの速度と方向を制御します。
-            通信が途絶えるとPico側のウォッチドッグが自動停止します。
+            DHCPとmDNSにより、接続するPCやLANが変わっても同じホスト名で接続できます。
           </p>
         </div>
         <div className="connectPanel lanPanel">
@@ -341,13 +345,13 @@ export default function Home() {
             <span className="board">PICO<span>W5500</span></span>
           </div>
           <label className="connectField">
-            <span>PICO IP / HOST</span>
+            <span>PICO HOST（通常は変更不要）</span>
             <input
               value={deviceAddress}
               onChange={(event) => setDeviceAddress(event.target.value)}
               disabled={connected}
               inputMode="url"
-              placeholder={DEFAULT_DEVICE}
+              placeholder="pico-motor.local"
             />
           </label>
           <label className="connectField">
@@ -369,7 +373,7 @@ export default function Home() {
             <span aria-hidden="true">{connected ? "×" : "↗"}</span>
             {connecting ? "接続しています…" : connected ? "LANを切断" : "Picoへ接続"}
           </button>
-          <small>PCとPicoを同じLANに接続してください</small>
+          <small>接続先: http://pico-motor.local ・ 初回起動は最大15秒</small>
         </div>
       </section>
 
@@ -380,7 +384,9 @@ export default function Home() {
             <h2>モーター操作</h2>
             {deviceInfo && (
               <p className="deviceMeta">
-                API watchdog {deviceInfo.watchdogMs / 1000}s ・ 最大 {deviceInfo.maxSpeed.toLocaleString()} steps/s
+                {deviceInfo.hostname ?? DEFAULT_DEVICE} → {deviceInfo.ip}（
+                {deviceInfo.networkMode === "link-local" ? "PC直結" : "DHCP"}）・
+                API watchdog {deviceInfo.watchdogMs / 1000}s
               </p>
             )}
           </div>
@@ -482,7 +488,7 @@ export default function Home() {
 
       <footer>
         <p><b>安全機能</b> ブラウザからの更新が10秒間途絶えると、Picoがモーターを自動停止します。</p>
-        <p>W5500 <span>•</span> HTTP API <span>•</span> STATIC IP</p>
+        <p>W5500 <span>•</span> DHCP <span>•</span> mDNS</p>
       </footer>
     </main>
   );

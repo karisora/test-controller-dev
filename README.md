@@ -36,16 +36,14 @@ PicoとW5500は3.3Vロジックです。モーターはPicoから直接駆動せ
 
 ### 1. ネットワーク設定
 
-初期値は以下です。
+Picoは起動時にDHCPで、そのLANに合ったIPアドレスを自動取得します。固定IPの設定は不要です。
 
-- Pico: `192.168.1.50`
-- Gateway/DNS: `192.168.1.1`
-- Subnet: `255.255.255.0`
+- 接続ホスト名: `pico-motor.local`
 - HTTP port: `80`
+- DHCP待機時間: 最大15秒
+- DHCPサーバーがないPC直結時: `169.254.50.50/16`へ自動フォールバック
 
-LAN環境が `192.168.0.x` などの場合は、[firmware/CMakeLists.txt](firmware/CMakeLists.txt) の `MOTOR_IP_*` と `MOTOR_GATEWAY_*` を変更してください。`MOTOR_IP_ADDRESS` の表示用文字列も同じIPに合わせます。
-
-同じLAN内で重複しない固定IPを選び、可能ならルーター側のDHCP配布範囲外にしてください。
+ルーター経由でもPCとのLANケーブル直結でも、通常はWeb画面へ `pico-motor.local` を入力するだけで接続できます。ホスト名は[firmware/CMakeLists.txt](firmware/CMakeLists.txt)の`MOTOR_HOSTNAME`で変更できます。
 
 ### 2. ビルド
 
@@ -70,13 +68,13 @@ MOTOR_API_KEY="change-this-key"
 ### 状態取得
 
 ```bash
-curl http://192.168.1.50/api/status
+curl http://pico-motor.local/api/status
 ```
 
 ### Motor 1を正転800 steps/s
 
 ```bash
-curl -X PUT http://192.168.1.50/api/motors/1 \
+curl -X PUT http://pico-motor.local/api/motors/1 \
   -H 'Content-Type: application/json' \
   -d '{"speed":800}'
 ```
@@ -84,7 +82,7 @@ curl -X PUT http://192.168.1.50/api/motors/1 \
 ### Motor 2を逆転1200 steps/s
 
 ```bash
-curl -X PUT http://192.168.1.50/api/motors/2 \
+curl -X PUT http://pico-motor.local/api/motors/2 \
   -H 'Content-Type: application/json' \
   -d '{"speed":-1200}'
 ```
@@ -92,7 +90,7 @@ curl -X PUT http://192.168.1.50/api/motors/2 \
 ### 全停止
 
 ```bash
-curl -X POST http://192.168.1.50/api/stop
+curl -X POST http://pico-motor.local/api/stop
 ```
 
 APIキーを設定した場合は、すべてのリクエストへ `-H 'X-API-Key: change-this-key'` を追加します。
@@ -106,7 +104,9 @@ npm install
 npm run dev
 ```
 
-PCとPicoを同じLANへ接続し、ブラウザで `http://localhost:3000` を開きます。PicoのIPを入力して「Picoへ接続」を押してください。
+PCとPicoを同じLANへ接続し、ブラウザで `http://localhost:3000` を開きます。初期値の `pico-motor.local` のまま「Picoへ接続」を押してください。
+
+PCとPicoをLANケーブルで直接つなぐ場合は、起動後15〜30秒ほど待ってから接続してください。DHCPがないためPicoは`169.254.50.50`、PCはOSの自動設定による`169.254.x.x`を使用します。
 
 W5500側はHTTPのみのため、VercelなどHTTPSで公開した画面から直接アクセスするとブラウザのMixed Content制限で遮断されます。この操作画面はLAN内のPCで `localhost` として起動してください。
 

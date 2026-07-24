@@ -22,31 +22,26 @@ endif()
 
 add_executable(pico_lan_stepper
   main.c
+  mdns_responder.c
   w5500_ethernet.c
   ${iolibrary_driver_SOURCE_DIR}/Ethernet/socket.c
   ${iolibrary_driver_SOURCE_DIR}/Ethernet/wizchip_conf.c
   ${iolibrary_driver_SOURCE_DIR}/Ethernet/W5500/w5500.c
+  ${iolibrary_driver_SOURCE_DIR}/Internet/DHCP/dhcp.c
 )
 
 target_include_directories(pico_lan_stepper PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}
   ${iolibrary_driver_SOURCE_DIR}/Ethernet
   ${iolibrary_driver_SOURCE_DIR}/Ethernet/W5500
+  ${iolibrary_driver_SOURCE_DIR}/Internet/DHCP
 )
 
 target_compile_definitions(pico_lan_stepper PRIVATE
   _WIZCHIP_=W5500
   MAX_SPEED_STEPS_PER_SEC=20000
   MOTOR_API_WATCHDOG_MS=10000
-  MOTOR_IP_ADDRESS="192.168.1.50"
-  MOTOR_IP_OCTET_1=192
-  MOTOR_IP_OCTET_2=168
-  MOTOR_IP_OCTET_3=1
-  MOTOR_IP_OCTET_4=50
-  MOTOR_GATEWAY_OCTET_1=192
-  MOTOR_GATEWAY_OCTET_2=168
-  MOTOR_GATEWAY_OCTET_3=1
-  MOTOR_GATEWAY_OCTET_4=1
+  MOTOR_HOSTNAME="pico-motor"
 )
 
 target_link_libraries(pico_lan_stepper

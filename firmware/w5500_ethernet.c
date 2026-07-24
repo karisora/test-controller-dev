@@ -1,7 +1,10 @@
 #include "w5500_ethernet.h"
 
+#include "dhcp.h"
 #include "hardware/spi.h"
+#include "mdns_responder.h"
 #include "pico/stdlib.h"
+#include "pico/time.h"
 #include "socket.h"
 #include "wizchip_conf.h"
 #include "W5500/w5500.h"
@@ -35,42 +38,6 @@
 #define W5500_RESET_PIN 20u
 #endif
 
-#ifndef MOTOR_IP_OCTET_1
-#define MOTOR_IP_OCTET_1 192
-#endif
-#ifndef MOTOR_IP_OCTET_2
-#define MOTOR_IP_OCTET_2 168
-#endif
-#ifndef MOTOR_IP_OCTET_3
-#define MOTOR_IP_OCTET_3 1
-#endif
-#ifndef MOTOR_IP_OCTET_4
-#define MOTOR_IP_OCTET_4 50
-#endif
-#ifndef MOTOR_GATEWAY_OCTET_1
-#define MOTOR_GATEWAY_OCTET_1 192
-#endif
-#ifndef MOTOR_GATEWAY_OCTET_2
-#define MOTOR_GATEWAY_OCTET_2 168
-#endif
-#ifndef MOTOR_GATEWAY_OCTET_3
-#define MOTOR_GATEWAY_OCTET_3 1
-#endif
-#ifndef MOTOR_GATEWAY_OCTET_4
-#define MOTOR_GATEWAY_OCTET_4 1
-#endif
-#ifndef MOTOR_SUBNET_OCTET_1
-#define MOTOR_SUBNET_OCTET_1 255
-#endif
-#ifndef MOTOR_SUBNET_OCTET_2
-#define MOTOR_SUBNET_OCTET_2 255
-#endif
-#ifndef MOTOR_SUBNET_OCTET_3
-#define MOTOR_SUBNET_OCTET_3 255
-#endif
-#ifndef MOTOR_SUBNET_OCTET_4
-#define MOTOR_SUBNET_OCTET_4 0
-#endif
 #ifndef MOTOR_MAC_OCTET_1
 #define MOTOR_MAC_OCTET_1 0x02
 #endif
@@ -100,7 +67,10 @@
 #endif
 
 #define HTTP_SOCKET 0
+#define DHCP_SOCKET 1
 #define HTTP_PORT 80
+#define DHCP_BUFFER_SIZE 1024u
+#define DHCP_STARTUP_TIMEOUT_US 15000000u
 #define REQUEST_BUFFER_SIZE 1024u
 #define RESPONSE_BUFFER_SIZE 768u
 #define REQUEST_TIMEOUT_US 2000000u
@@ -112,6 +82,14 @@ static w5500_motor_status_callback_t read_motor_speed;
 static char request_buffer[REQUEST_BUFFER_SIZE];
 static size_t request_length;
 static uint64_t request_started_us;
+static uint8_t dhcp_buffer[DHCP_BUFFER_SIZE];
+static wiz_NetInfo current_network;
+static char current_ip_address[16] = "0.0.0.0";
+static bool dhcp_enabled;
+static bool dhcp_address_ready;
+static bool mdns_started;
+static bool dhcp_timer_started;
+static struct repeating_timer dhcp_timer;
 
 static void chip_select(void)
 {
@@ -141,6 +119,120 @@ static void reset_chip(void)
     sleep_ms(2);
     gpio_put(W5500_RESET_PIN, 1);
     sleep_ms(100);
+}
+
+static void format_current_ip(void)
+{
+    snprintf(current_ip_address, sizeof(current_ip_address), "%u.%u.%u.%u",
+             current_network.ip[0], current_network.ip[1],
+             current_network.ip[2], current_network.ip[3]);
+}
+
+static void dhcp_address_callback(void)
+{
+    dhcp_address_ready = true;
+}
+
+static void dhcp_conflict_callback(void)
+{
+    dhcp_address_ready = false;
+    printf("DHCP address conflict\r\n");
+}
+
+static bool apply_dhcp_address(void)
+{
+    wiz_NetInfo assigned = current_network;
+    getSHAR(assigned.mac);
+    getIPfromDHCP(assigned.ip);
+    getGWfromDHCP(assigned.gw);
+    getSNfromDHCP(assigned.sn);
+    getDNSfromDHCP(assigned.dns);
+    assigned.dhcp = NETINFO_DHCP;
+
+    if ((assigned.ip[0] | assigned.ip[1] |
+         assigned.ip[2] | assigned.ip[3]) == 0) {
+        return false;
+    }
+
+    bool changed = memcmp(current_network.ip, assigned.ip, 4) != 0;
+    current_network = assigned;
+    ctlnetwork(CN_SET_NETINFO, &current_network);
+    format_current_ip();
+    dhcp_address_ready = false;
+    return changed;
+}
+
+static void configure_link_local(void)
+{
+    wiz_NetInfo fallback = {
+        .mac = {MOTOR_MAC_OCTET_1, MOTOR_MAC_OCTET_2, MOTOR_MAC_OCTET_3,
+                MOTOR_MAC_OCTET_4, MOTOR_MAC_OCTET_5, MOTOR_MAC_OCTET_6},
+        .ip = {169, 254, 50, 50},
+        .sn = {255, 255, 0, 0},
+        .gw = {0, 0, 0, 0},
+        .dns = {0, 0, 0, 0},
+        .dhcp = NETINFO_STATIC,
+    };
+    current_network = fallback;
+    ctlnetwork(CN_SET_NETINFO, &current_network);
+    format_current_ip();
+    dhcp_enabled = false;
+}
+
+static bool dhcp_timer_callback(struct repeating_timer *timer)
+{
+    (void)timer;
+    DHCP_time_handler();
+    return true;
+}
+
+static bool acquire_network_address(void)
+{
+    memset(&current_network, 0, sizeof(current_network));
+    current_network.mac[0] = MOTOR_MAC_OCTET_1;
+    current_network.mac[1] = MOTOR_MAC_OCTET_2;
+    current_network.mac[2] = MOTOR_MAC_OCTET_3;
+    current_network.mac[3] = MOTOR_MAC_OCTET_4;
+    current_network.mac[4] = MOTOR_MAC_OCTET_5;
+    current_network.mac[5] = MOTOR_MAC_OCTET_6;
+    current_network.dhcp = NETINFO_DHCP;
+    setSHAR(current_network.mac);
+
+    DHCP_init(DHCP_SOCKET, dhcp_buffer);
+    reg_dhcp_cbfunc(dhcp_address_callback, dhcp_address_callback,
+                    dhcp_conflict_callback);
+    dhcp_enabled = true;
+    dhcp_address_ready = false;
+    dhcp_timer_started =
+        add_repeating_timer_ms(1000, dhcp_timer_callback, NULL, &dhcp_timer);
+    if (!dhcp_timer_started) {
+        DHCP_stop();
+        configure_link_local();
+        printf("DHCP timer unavailable; using link-local %s\r\n",
+               current_ip_address);
+        return true;
+    }
+    uint64_t deadline = time_us_64() + DHCP_STARTUP_TIMEOUT_US;
+
+    while (time_us_64() < deadline) {
+        uint8_t result = DHCP_run();
+        if (dhcp_address_ready || result == DHCP_IP_LEASED) {
+            if (apply_dhcp_address()) {
+                printf("DHCP assigned %s\r\n", current_ip_address);
+                return true;
+            }
+        }
+        sleep_ms(10);
+    }
+
+    DHCP_stop();
+    if (dhcp_timer_started) {
+        cancel_repeating_timer(&dhcp_timer);
+        dhcp_timer_started = false;
+    }
+    configure_link_local();
+    printf("DHCP unavailable; using link-local %s\r\n", current_ip_address);
+    return true;
 }
 
 static bool ascii_equal_ignore_case(const char *left, const char *right,
@@ -284,11 +376,14 @@ static void send_status(void)
     char body[400];
     snprintf(
         body, sizeof(body),
-        "{\"ok\":true,\"ip\":\"" MOTOR_IP_ADDRESS "\","
+        "{\"ok\":true,\"ip\":\"%s\","
+        "\"hostname\":\"" MOTOR_HOSTNAME ".local\","
+        "\"networkMode\":\"%s\","
         "\"motors\":["
         "{\"id\":\"0x100\",\"speed\":%ld,\"running\":%s},"
         "{\"id\":\"0x101\",\"speed\":%ld,\"running\":%s}],"
         "\"maxSpeed\":%d,\"watchdogMs\":%u,\"apiKeyRequired\":%s}",
+        current_ip_address, dhcp_enabled ? "dhcp" : "link-local",
         (long)motor1, motor1 == 0 ? "false" : "true",
         (long)motor2, motor2 == 0 ? "false" : "true",
         MAX_SPEED_STEPS_PER_SEC, MOTOR_API_WATCHDOG_MS,
@@ -371,6 +466,29 @@ static void reset_request(void)
     request_buffer[0] = '\0';
 }
 
+static void service_dhcp(void)
+{
+    if (!dhcp_enabled) {
+        return;
+    }
+
+    uint8_t result = DHCP_run();
+    if (!dhcp_address_ready && result != DHCP_IP_ASSIGN &&
+        result != DHCP_IP_CHANGED && result != DHCP_IP_LEASED) {
+        return;
+    }
+
+    if (apply_dhcp_address()) {
+        printf("DHCP address changed to %s\r\n", current_ip_address);
+        close(HTTP_SOCKET);
+        reset_request();
+        if (mdns_started) {
+            mdns_responder_stop();
+            mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
+        }
+    }
+}
+
 bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
                          w5500_motor_status_callback_t status_callback)
 {
@@ -402,25 +520,19 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
         return false;
     }
 
-    wiz_NetInfo network = {
-        .mac = {MOTOR_MAC_OCTET_1, MOTOR_MAC_OCTET_2, MOTOR_MAC_OCTET_3,
-                MOTOR_MAC_OCTET_4, MOTOR_MAC_OCTET_5, MOTOR_MAC_OCTET_6},
-        .ip = {MOTOR_IP_OCTET_1, MOTOR_IP_OCTET_2, MOTOR_IP_OCTET_3,
-               MOTOR_IP_OCTET_4},
-        .sn = {MOTOR_SUBNET_OCTET_1, MOTOR_SUBNET_OCTET_2,
-               MOTOR_SUBNET_OCTET_3, MOTOR_SUBNET_OCTET_4},
-        .gw = {MOTOR_GATEWAY_OCTET_1, MOTOR_GATEWAY_OCTET_2,
-               MOTOR_GATEWAY_OCTET_3, MOTOR_GATEWAY_OCTET_4},
-        .dns = {MOTOR_GATEWAY_OCTET_1, MOTOR_GATEWAY_OCTET_2,
-                MOTOR_GATEWAY_OCTET_3, MOTOR_GATEWAY_OCTET_4},
-        .dhcp = NETINFO_STATIC,
-    };
-    ctlnetwork(CN_SET_NETINFO, &network);
+    acquire_network_address();
+    mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
+    if (!mdns_started) {
+        printf("mDNS init failed; use http://%s instead\r\n",
+               current_ip_address);
+    }
     return true;
 }
 
 void w5500_ethernet_service(void)
 {
+    service_dhcp();
+
     uint8_t state = getSn_SR(HTTP_SOCKET);
 
     switch (state) {
@@ -486,4 +598,13 @@ void w5500_ethernet_service(void)
         default:
             break;
     }
+
+    if (mdns_started) {
+        mdns_responder_service(current_network.ip);
+    }
+}
+
+const char *w5500_ethernet_ip_address(void)
+{
+    return current_ip_address;
 }

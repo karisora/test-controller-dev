@@ -690,9 +690,11 @@ async function proxyRequest(request: Request, context: RouteContext) {
       path === "api/motors/2" ||
       path === "api/motors/sync";
     const heartbeat = path === "api/heartbeat";
-    const fetchUpstream = async (address: string) =>
+    const shortHttpControl =
       (urgent || (heartbeat && forceHttpControl)) &&
-      (!commandId || forceHttpControl)
+      (!commandId || forceHttpControl);
+    const fetchUpstream = async (address: string) =>
+      shortHttpControl
         ? requestPicoUrgent(
             address,
             path,
@@ -708,6 +710,39 @@ async function proxyRequest(request: Request, context: RouteContext) {
             body,
             SAME_ADDRESS_ATTEMPTS,
           );
+
+    if (
+      path === "api/status" &&
+      isDefaultPicoHostname(target.hostname) &&
+      !addressCache.get(target.hostname.toLowerCase()) &&
+      localAddressFor(LINK_LOCAL_FALLBACK)
+    ) {
+      try {
+        const upstream = await requestPico(
+          LINK_LOCAL_FALLBACK,
+          path,
+          request.method,
+          headers,
+          body,
+          300,
+        );
+        addressCache.set(target.hostname.toLowerCase(), {
+          address: LINK_LOCAL_FALLBACK,
+          expiresAt: Date.now() + ADDRESS_CACHE_MS,
+        });
+        return new Response(upstream.text, {
+          status: upstream.status,
+          headers: {
+            "Content-Type":
+              upstream.contentType ?? "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+          },
+        });
+      } catch {
+        // Not a direct-cable setup, or the Pico is still booting. Fall through
+        // to mDNS/DNS discovery for normal LAN setups.
+      }
+    }
 
     // A safety heartbeat must never pause for mDNS. The normal connection or
     // status request has already cached the resolved address; keep using that
@@ -786,12 +821,10 @@ async function proxyRequest(request: Request, context: RouteContext) {
       // the address cache after retrying the known LAN path, then resolve again.
       try {
         address = await resolvePrivateAddress(target.hostname, true);
-        upstream =
-          (urgent || (heartbeat && forceHttpControl)) &&
-          (!commandId || forceHttpControl)
-            ? await requestPicoUrgent(
-                address,
-                path,
+        upstream = shortHttpControl
+          ? await requestPicoUrgent(
+              address,
+              path,
               request.method,
               headers,
               body,
@@ -814,12 +847,10 @@ async function proxyRequest(request: Request, context: RouteContext) {
             address,
             expiresAt: Date.now() + ADDRESS_CACHE_MS,
           });
-          upstream =
-            (urgent || (heartbeat && forceHttpControl)) &&
-            (!commandId || forceHttpControl)
-              ? await requestPicoUrgent(
-                  address,
-                  path,
+          upstream = shortHttpControl
+            ? await requestPicoUrgent(
+                address,
+                path,
                 request.method,
                 headers,
                 body,

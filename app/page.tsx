@@ -26,6 +26,7 @@ type ApiStatus = {
   ok: boolean;
   ip: string;
   hostname?: string;
+  firmwareVersion?: string;
   networkMode?: "dhcp" | "link-local";
   motors: ApiMotor[];
   maxSpeed: number;
@@ -430,6 +431,7 @@ export default function Home() {
               <p className="deviceMeta">
                 {deviceInfo.hostname ?? DEFAULT_DEVICE} → {deviceInfo.ip}（
                 {deviceInfo.networkMode === "link-local" ? "PC直結" : "DHCP"}）・
+                FW {deviceInfo.firmwareVersion ?? "unknown"}・
                 API watchdog {deviceInfo.watchdogMs / 1000}s
               </p>
             )}

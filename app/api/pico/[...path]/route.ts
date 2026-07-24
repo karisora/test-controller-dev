@@ -1,6 +1,8 @@
 import { lookup } from "node:dns/promises";
 import dgram from "node:dgram";
+import { request as httpRequest } from "node:http";
 import { isIP } from "node:net";
+import { networkInterfaces } from "node:os";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,6 +17,8 @@ const DISCOVERY_TIMEOUT_MS = 1500;
 const DNS_TIMEOUT_MS = 1200;
 const UPSTREAM_TIMEOUT_MS = 2000;
 const ADDRESS_CACHE_MS = 30000;
+const DEFAULT_PICO_HOSTNAME = "pico-motor.local";
+const LINK_LOCAL_FALLBACK = "169.254.50.50";
 
 type AddressCacheEntry = {
   address: string;
@@ -43,6 +47,33 @@ function isPrivateIpv4(address: string) {
     (first === 192 && second === 168) ||
     (first === 169 && second === 254)
   );
+}
+
+function ipv4Number(address: string) {
+  return address
+    .split(".")
+    .map(Number)
+    .reduce((value, octet) => ((value << 8) | octet) >>> 0, 0);
+}
+
+function localAddressFor(remoteAddress: string) {
+  const remote = ipv4Number(remoteAddress);
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (
+        address.internal ||
+        address.family !== "IPv4" ||
+        !isPrivateIpv4(address.address)
+      ) {
+        continue;
+      }
+      const mask = ipv4Number(address.netmask);
+      if ((remote & mask) === (ipv4Number(address.address) & mask)) {
+        return address.address;
+      }
+    }
+  }
+  return undefined;
 }
 
 function encodeMdnsQuery(hostname: string) {
@@ -112,33 +143,83 @@ function readMdnsAddress(packet: Buffer) {
 
 async function discoverMdns(hostname: string) {
   const query = encodeMdnsQuery(hostname);
+  const interfaceAddresses = new Set<string>();
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (
+        !address.internal &&
+        address.family === "IPv4" &&
+        isPrivateIpv4(address.address)
+      ) {
+        interfaceAddresses.add(address.address);
+      }
+    }
+  }
+  // Let the OS select an interface only when no usable IPv4 interface was
+  // reported. Normally one socket is opened for every Wi-Fi/Ethernet adapter.
+  const outgoingInterfaces =
+    interfaceAddresses.size > 0 ? [...interfaceAddresses] : [undefined];
+
   return new Promise<string>((resolve, reject) => {
-    const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+    const sockets: dgram.Socket[] = [];
+    const failedSockets = new Set<dgram.Socket>();
     let settled = false;
+    let lastError = new Error(`${hostname} がLAN内で見つかりません`);
     const finish = (error?: Error, address?: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      socket.close();
+      for (const socket of sockets) {
+        try {
+          socket.close();
+        } catch {
+          // A socket can fail before bind() completes.
+        }
+      }
       if (error) reject(error);
       else resolve(address as string);
+    };
+    const failSocket = (socket: dgram.Socket, error: Error) => {
+      if (settled || failedSockets.has(socket)) return;
+      failedSockets.add(socket);
+      lastError = error;
+      try {
+        socket.close();
+      } catch {
+        // The aggregate timeout or another interface can still succeed.
+      }
+      if (failedSockets.size === sockets.length) finish(lastError);
     };
     const timer = setTimeout(
       () => finish(new Error(`${hostname} がLAN内で見つかりません`)),
       DISCOVERY_TIMEOUT_MS,
     );
 
-    socket.on("error", (error) => finish(error));
-    socket.on("message", (packet) => {
-      const address = readMdnsAddress(packet);
-      if (address && isPrivateIpv4(address)) finish(undefined, address);
-    });
-    socket.bind(0, () => {
-      socket.setMulticastTTL(255);
-      socket.send(query, MDNS_PORT, MDNS_ADDRESS, (error) => {
-        if (error) finish(error);
+    for (const interfaceAddress of outgoingInterfaces) {
+      const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+      sockets.push(socket);
+      socket.on("error", (error) => failSocket(socket, error));
+      socket.on("message", (packet) => {
+        const address = readMdnsAddress(packet);
+        if (address && isPrivateIpv4(address)) finish(undefined, address);
       });
-    });
+      socket.bind(0, () => {
+        try {
+          socket.setMulticastTTL(255);
+          if (interfaceAddress) {
+            socket.setMulticastInterface(interfaceAddress);
+          }
+          socket.send(query, MDNS_PORT, MDNS_ADDRESS, (error) => {
+            if (error) failSocket(socket, error);
+          });
+        } catch (error) {
+          failSocket(
+            socket,
+            error instanceof Error ? error : new Error("mDNS送信に失敗しました"),
+          );
+        }
+      });
+    }
   });
 }
 
@@ -173,6 +254,11 @@ async function resolvePrivateAddressUncached(hostname: string) {
     ]);
     resolvedAddress = result.address;
   } catch {
+    if (hostname.toLowerCase() === DEFAULT_PICO_HOSTNAME) {
+      // Direct PC-to-Pico connections always use this deterministic address.
+      // This also works on systems where .local lookup is unavailable.
+      return LINK_LOCAL_FALLBACK;
+    }
     throw new Error(
       `${hostname} がLAN内で見つかりません。Picoの電源・LANケーブル・新しいファームウェアを確認してください`,
     );
@@ -228,6 +314,59 @@ function endpointAllowed(method: string, path: string) {
   );
 }
 
+function requestPico(
+  address: string,
+  path: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string | undefined,
+) {
+  return new Promise<{
+    status: number;
+    contentType: string | undefined;
+    text: string;
+  }>((resolve, reject) => {
+    const request = httpRequest(
+      {
+        hostname: address,
+        port: 80,
+        path: `/${path}`,
+        method,
+        headers,
+        localAddress: localAddressFor(address),
+        family: 4,
+        agent: false,
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        let length = 0;
+        response.on("data", (chunk: Buffer) => {
+          length += chunk.length;
+          if (length > 65536) {
+            request.destroy(new Error("Picoの応答が大きすぎます"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on("end", () => {
+          resolve({
+            status: response.statusCode ?? 502,
+            contentType: response.headers["content-type"],
+            text: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+        response.on("error", reject);
+      },
+    );
+    request.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+      request.destroy(new Error("PicoのHTTP応答がタイムアウトしました"));
+    });
+    request.on("error", reject);
+    if (body) request.write(body);
+    request.end();
+  });
+}
+
 async function proxyRequest(request: Request, context: RouteContext) {
   const { path: segments } = await context.params;
   const path = segments.join("/");
@@ -250,31 +389,21 @@ async function proxyRequest(request: Request, context: RouteContext) {
       return jsonError("Picoの接続先はHTTPポート80を指定してください", 400);
     }
 
-    const headers = new Headers();
+    const headers: Record<string, string> = {
+      Host: target.hostname,
+      Connection: "close",
+    };
     const contentType = request.headers.get("content-type");
     const apiKey = request.headers.get("x-api-key");
-    if (contentType) headers.set("Content-Type", contentType);
-    if (apiKey) headers.set("X-API-Key", apiKey);
-    headers.set("Host", target.hostname);
-    headers.set("Connection", "close");
+    if (contentType) headers["Content-Type"] = contentType;
+    if (apiKey) headers["X-API-Key"] = apiKey;
 
     const body =
       request.method === "GET" || request.method === "HEAD"
         ? undefined
         : await request.text();
     const fetchUpstream = async (address: string) => {
-      const upstream = await fetch(`http://${address}/${path}`, {
-        method: request.method,
-        headers,
-        body,
-        cache: "no-store",
-        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-      });
-      return {
-        status: upstream.status,
-        contentType: upstream.headers.get("content-type"),
-        text: await upstream.text(),
-      };
+      return requestPico(address, path, request.method, headers, body);
     };
 
     let address = await resolvePrivateAddress(target.hostname);

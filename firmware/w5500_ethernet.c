@@ -63,6 +63,9 @@
 #ifndef MOTOR_API_WATCHDOG_MS
 #define MOTOR_API_WATCHDOG_MS 1000u
 #endif
+#ifndef MOTOR_FIRMWARE_VERSION
+#define MOTOR_FIRMWARE_VERSION "dev"
+#endif
 #ifndef MAX_SPEED_STEPS_PER_SEC
 #define MAX_SPEED_STEPS_PER_SEC 20000
 #endif
@@ -75,6 +78,7 @@
 #define REQUEST_BUFFER_SIZE 2048u
 #define RESPONSE_BUFFER_SIZE 2048u
 #define REQUEST_TIMEOUT_US 2000000u
+#define RESPONSE_CLOSE_TIMEOUT_US 1000000u
 #define HTTP_CLOSE_TIMEOUT_US 250000u
 #define PHY_LINK_CHECK_INTERVAL_US 1000u
 #define MOTOR1_ID 0x100u
@@ -85,6 +89,9 @@ static w5500_motor_status_callback_t read_motor_speed;
 static char request_buffer[REQUEST_BUFFER_SIZE];
 static size_t request_length;
 static uint64_t request_started_us;
+static bool response_sent;
+static uint64_t response_sent_us;
+static bool response_queued;
 static uint8_t dhcp_buffer[DHCP_BUFFER_SIZE];
 static wiz_NetInfo current_network;
 static uint8_t device_mac[6] = {
@@ -389,6 +396,27 @@ static bool parse_speed_json(const char *body, int32_t *speed)
     return true;
 }
 
+static bool queue_http_response(const uint8_t *first, size_t first_length,
+                                const uint8_t *second, size_t second_length)
+{
+    size_t total = first_length + second_length;
+    if (total == 0 || total > getSn_TxMAX(HTTP_SOCKET) ||
+        total > getSn_TX_FSR(HTTP_SOCKET)) {
+        return false;
+    }
+
+    wiz_send_data(HTTP_SOCKET, (uint8_t *)first, (uint16_t)first_length);
+    if (second != NULL && second_length != 0) {
+        wiz_send_data(HTTP_SOCKET, (uint8_t *)second,
+                      (uint16_t)second_length);
+    }
+    setSn_CR(HTTP_SOCKET, Sn_CR_SEND);
+    while (getSn_CR(HTTP_SOCKET) != 0) {
+    }
+    response_queued = true;
+    return true;
+}
+
 static void send_json(int status, const char *status_text, const char *json)
 {
     char response[RESPONSE_BUFFER_SIZE];
@@ -407,7 +435,8 @@ static void send_json(int status, const char *status_text, const char *json)
         "Connection: close\r\n\r\n%s",
         status, status_text, body_length, json);
     if (length > 0 && (size_t)length < sizeof(response)) {
-        send(HTTP_SOCKET, (uint8_t *)response, (uint16_t)length);
+        queue_http_response((const uint8_t *)response, (size_t)length,
+                            NULL, 0);
     }
 }
 
@@ -462,8 +491,8 @@ static void send_control_page(void)
         "Connection: close\r\n\r\n",
         body_length);
     if (header_length > 0 && (size_t)header_length < sizeof(header)) {
-        send(HTTP_SOCKET, (uint8_t *)header, (uint16_t)header_length);
-        send(HTTP_SOCKET, (uint8_t *)page, (uint16_t)body_length);
+        queue_http_response((const uint8_t *)header, (size_t)header_length,
+                            (const uint8_t *)page, (size_t)body_length);
     }
 }
 
@@ -476,6 +505,7 @@ static void send_status(void)
         body, sizeof(body),
         "{\"ok\":true,\"ip\":\"%s\","
         "\"hostname\":\"" MOTOR_HOSTNAME ".local\","
+        "\"firmwareVersion\":\"" MOTOR_FIRMWARE_VERSION "\","
         "\"networkMode\":\"%s\","
         "\"motors\":["
         "{\"id\":\"0x100\",\"speed\":%ld,\"running\":%s},"
@@ -571,25 +601,24 @@ static void reset_request(void)
 {
     request_length = 0;
     request_started_us = 0;
+    response_sent = false;
+    response_sent_us = 0;
+    response_queued = false;
     request_buffer[0] = '\0';
+}
+
+static void mark_response_sent(void)
+{
+    request_length = 0;
+    request_started_us = 0;
+    request_buffer[0] = '\0';
+    response_sent = true;
+    response_sent_us = time_us_64();
 }
 
 static void reset_http_socket(void)
 {
     close(HTTP_SOCKET);
-    reset_request();
-    previous_http_socket_state = 0xffu;
-    http_socket_state_started_us = time_us_64();
-}
-
-static void begin_http_disconnect(void)
-{
-    // ioLibrary's disconnect() waits synchronously until the peer completes
-    // the TCP close handshake. Issue only the W5500 command here so a vanished
-    // browser cannot block the entire firmware service loop.
-    setSn_CR(HTTP_SOCKET, Sn_CR_DISCON);
-    while (getSn_CR(HTTP_SOCKET) != 0) {
-    }
     reset_request();
     previous_http_socket_state = 0xffu;
     http_socket_state_started_us = time_us_64();
@@ -757,6 +786,25 @@ void w5500_ethernet_service(void)
                 reset_request();
             }
 
+            if (response_sent) {
+                uint8_t interrupts = getSn_IR(HTTP_SOCKET);
+                if (interrupts & Sn_IR_TIMEOUT) {
+                    setSn_IR(HTTP_SOCKET, Sn_IR_TIMEOUT);
+                    reset_http_socket();
+                    break;
+                }
+                if (interrupts & Sn_IR_SENDOK) {
+                    setSn_IR(HTTP_SOCKET, Sn_IR_SENDOK);
+                }
+                // "Connection: close" makes normal HTTP clients send FIN as
+                // soon as the full Content-Length body is read. Wait for that
+                // passive close; only force-close a client that never leaves.
+                if (now - response_sent_us >= RESPONSE_CLOSE_TIMEOUT_US) {
+                    reset_http_socket();
+                }
+                break;
+            }
+
             uint16_t available = getSn_RX_RSR(HTTP_SOCKET);
             if (available != 0) {
                 if (request_started_us == 0) {
@@ -767,7 +815,11 @@ void w5500_ethernet_service(void)
                 if (chunk == 0) {
                     send_json(413, "Payload Too Large",
                               "{\"ok\":false,\"error\":\"request too large\"}");
-                    begin_http_disconnect();
+                    if (response_queued) {
+                        mark_response_sent();
+                    } else {
+                        reset_http_socket();
+                    }
                     break;
                 }
                 int32_t received =
@@ -785,14 +837,22 @@ void w5500_ethernet_service(void)
                 size_t content_length = request_content_length(request_buffer);
                 if (request_length >= header_length + content_length) {
                     handle_request(request_buffer);
-                    begin_http_disconnect();
+                    if (response_queued) {
+                        mark_response_sent();
+                    } else {
+                        reset_http_socket();
+                    }
                 }
             }
             if (request_started_us != 0 &&
                 time_us_64() - request_started_us > REQUEST_TIMEOUT_US) {
                 send_json(408, "Request Timeout",
                           "{\"ok\":false,\"error\":\"request timeout\"}");
-                begin_http_disconnect();
+                if (response_queued) {
+                    mark_response_sent();
+                } else {
+                    reset_http_socket();
+                }
             }
             break;
         }

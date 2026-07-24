@@ -32,15 +32,25 @@ type ApiStatus = {
   maxSpeed: number;
   watchdogMs: number;
   apiKeyRequired: boolean;
+  udpDiagnosticAck?: boolean;
+  udpControlProtocol?: number;
+  urgentCommands?: number;
+  safetyKeepalives?: number;
+  udpCommandSession?: number;
+  socketCommandTimeouts?: number;
   error?: string;
 };
 
 const MAX_SPEED = 20000;
 const DEFAULT_DEVICE = "pico-motor.local";
-const HEARTBEAT_MS = 100;
+const HEARTBEAT_TICK_MS = 250;
+const UDP_HEARTBEAT_MS = 250;
+const HTTP_HEARTBEAT_MS = 750;
 const API_TIMEOUT_MS = 12000;
 const RECONNECT_DELAY_MS = 2000;
 const STATUS_FAILURE_LIMIT = 3;
+const STATUS_RECONCILE_DELAY_MS = 500;
+const REQUIRED_FIRMWARE_VERSION = "2026.07.25.21";
 
 function nowLabel() {
   return new Intl.DateTimeFormat("ja-JP", {
@@ -87,6 +97,10 @@ export default function Home() {
   const connectingRef = useRef(false);
   const statusPollInFlightRef = useRef(false);
   const heartbeatInFlightRef = useRef(false);
+  const commandInFlightRef = useRef(0);
+  const lastCommandAtRef = useRef(0);
+  const lastHeartbeatSentAtRef = useRef(0);
+  const udpRealtimeAvailableRef = useRef(false);
   const statusFailureCountRef = useRef(0);
   const heartbeatFailureCountRef = useRef(0);
 
@@ -194,11 +208,17 @@ export default function Home() {
     connectedRef.current = false;
     if (wasConnected && motorsRef.current.some((motor) => motor.running)) {
       try {
+        const headers: Record<string, string> = {
+          "X-Command-Id": String(commandIdRef.current),
+        };
+        if (!udpRealtimeAvailableRef.current) {
+          headers["X-Control-Transport"] = "http";
+        }
         await requestApi(
           "/api/stop",
           {
             method: "POST",
-            headers: { "X-Command-Id": String(commandIdRef.current) },
+            headers,
           },
           true,
         );
@@ -208,6 +228,7 @@ export default function Home() {
       }
     }
     activeBaseUrlRef.current = "";
+    lastHeartbeatSentAtRef.current = 0;
     statusFailureCountRef.current = 0;
     heartbeatFailureCountRef.current = 0;
     connectedRef.current = false;
@@ -227,9 +248,42 @@ export default function Home() {
       window.localStorage.setItem("pico-device-address", deviceAddress.trim());
       window.localStorage.setItem("pico-api-key", apiKey);
       const status = await requestApi("/api/status");
-      applyStatus(status);
+      if (status.udpControlProtocol !== 2) {
+        throw new Error(
+          `低遅延制御プロトコルv2に未対応です。PicoへFW ${REQUIRED_FIRMWARE_VERSION} 以降を書き込んでください`,
+        );
+      }
+      if ((status.firmwareVersion ?? "") < REQUIRED_FIRMWARE_VERSION) {
+        throw new Error(
+          `PicoへFW ${REQUIRED_FIRMWARE_VERSION} 以降を書き込んでください。現在のFWは ${status.firmwareVersion ?? "unknown"} です`,
+        );
+      }
+      commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
+      let controlCheck: ApiStatus | null = null;
+      try {
+        controlCheck = await requestApi("/api/control-check", {
+          method: "POST",
+          headers: { "X-Command-Id": String(commandIdRef.current) },
+        });
+        udpRealtimeAvailableRef.current = true;
+      } catch (error) {
+        udpRealtimeAvailableRef.current = false;
+        addLog(
+          "error",
+          `UDP制御確認に失敗しました: ${
+            error instanceof Error ? error.message : "通信エラー"
+          }。HTTP制御モードで接続します`,
+        );
+      }
+      applyStatus({
+        ...status,
+        motors: controlCheck?.motors ?? status.motors,
+        udpCommandSession:
+          controlCheck?.udpCommandSession ?? status.udpCommandSession,
+      });
       statusFailureCountRef.current = 0;
       heartbeatFailureCountRef.current = 0;
+      lastHeartbeatSentAtRef.current = 0;
       connectedRef.current = true;
       setConnected(true);
       addLog(
@@ -240,6 +294,7 @@ export default function Home() {
       );
     } catch (error) {
       connectedRef.current = false;
+      udpRealtimeAvailableRef.current = false;
       setConnected(false);
       if (!automatic) {
         addLog("error", error instanceof Error ? error.message : "接続できませんでした");
@@ -266,7 +321,13 @@ export default function Home() {
   useEffect(() => {
     if (!connected) return;
     const timer = window.setInterval(async () => {
-      if (statusPollInFlightRef.current) return;
+      if (
+        statusPollInFlightRef.current ||
+        commandInFlightRef.current > 0 ||
+        Date.now() - lastCommandAtRef.current < STATUS_RECONCILE_DELAY_MS
+      ) {
+        return;
+      }
       statusPollInFlightRef.current = true;
       const generation = commandGenerationRef.current;
       try {
@@ -291,20 +352,36 @@ export default function Home() {
       } finally {
         statusPollInFlightRef.current = false;
       }
-    }, 2000);
+    }, 5000);
     return () => window.clearInterval(timer);
   }, [addLog, applyStatus, connected, requestApi]);
 
   useEffect(() => {
     if (!connected) return;
     const timer = window.setInterval(async () => {
-      if (heartbeatInFlightRef.current || !connectedRef.current) return;
+      const heartbeatPeriod = udpRealtimeAvailableRef.current
+        ? UDP_HEARTBEAT_MS
+        : HTTP_HEARTBEAT_MS;
+      const now = Date.now();
+      if (
+        heartbeatInFlightRef.current ||
+        !connectedRef.current ||
+        commandInFlightRef.current > 0 ||
+        now - lastHeartbeatSentAtRef.current < heartbeatPeriod
+      ) {
+        return;
+      }
+      lastHeartbeatSentAtRef.current = now;
       heartbeatInFlightRef.current = true;
       const generation = commandGenerationRef.current;
       try {
+        const headers: Record<string, string> = {};
+        if (!udpRealtimeAvailableRef.current) {
+          headers["X-Control-Transport"] = "http";
+        }
         await requestApi(
           "/api/heartbeat",
-          { method: "POST" },
+          { method: "POST", headers },
           true,
         );
         heartbeatFailureCountRef.current = 0;
@@ -320,7 +397,7 @@ export default function Home() {
       } finally {
         heartbeatInFlightRef.current = false;
       }
-    }, HEARTBEAT_MS);
+    }, HEARTBEAT_TICK_MS);
     return () => window.clearInterval(timer);
   }, [addLog, connected, requestApi]);
 
@@ -357,20 +434,32 @@ export default function Home() {
       return false;
     }
     syncRunTokenRef.current += 1;
-    commandGenerationRef.current += 1;
+    const generation = ++commandGenerationRef.current;
+    commandInFlightRef.current += 1;
+    lastCommandAtRef.current = Date.now();
     commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
     applyOptimisticMotor(index, speed);
     try {
       addLog("tx", `PUT /api/motors/${index + 1} {"speed":${speed}}`);
+      const headers: Record<string, string> = {
+        "X-Command-Id": String(commandIdRef.current),
+      };
+      if (!udpRealtimeAvailableRef.current) {
+        headers["X-Control-Transport"] = "http";
+      }
       await requestApi(`/api/motors/${index + 1}`, {
         method: "PUT",
-        headers: { "X-Command-Id": String(commandIdRef.current) },
+        headers,
         body: JSON.stringify({ speed }),
       });
+      if (generation !== commandGenerationRef.current) return true;
       return true;
     } catch (error) {
+      if (generation !== commandGenerationRef.current) return false;
       addLog("error", error instanceof Error ? error.message : "送信に失敗しました");
       return false;
+    } finally {
+      commandInFlightRef.current -= 1;
     }
   }
 
@@ -391,6 +480,8 @@ export default function Home() {
 
     const token = ++syncRunTokenRef.current;
     const generation = ++commandGenerationRef.current;
+    commandInFlightRef.current += 1;
+    lastCommandAtRef.current = Date.now();
     commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
     const snapshot = motorsRef.current.map(
       (motor) => motor.speed * motor.direction,
@@ -409,11 +500,18 @@ export default function Home() {
     );
 
     try {
+      const headers: Record<string, string> = {
+        "X-Command-Id": String(commandIdRef.current),
+      };
+      if (!udpRealtimeAvailableRef.current) {
+        headers["X-Control-Transport"] = "http";
+      }
       await requestApi("/api/motors/sync", {
         method: "PUT",
-        headers: { "X-Command-Id": String(commandIdRef.current) },
+        headers,
         body: JSON.stringify({ speed1: snapshot[0], speed2: snapshot[1] }),
       });
+      if (generation !== commandGenerationRef.current) return;
       if (
         token === syncRunTokenRef.current &&
         generation === commandGenerationRef.current
@@ -421,14 +519,19 @@ export default function Home() {
         addLog("info", "同期命令1回で2台のモーターを開始しました");
       }
     } catch (error) {
+      if (generation !== commandGenerationRef.current) return;
       addLog("error", error instanceof Error ? error.message : "同期命令に失敗しました");
+    } finally {
+      commandInFlightRef.current -= 1;
     }
   }
 
   async function emergencyStop() {
     if (!connectedRef.current) return;
     syncRunTokenRef.current += 1;
-    commandGenerationRef.current += 1;
+    const generation = ++commandGenerationRef.current;
+    commandInFlightRef.current += 1;
+    lastCommandAtRef.current = Date.now();
     commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
     const stopped = motorsRef.current.map((motor) => ({
       ...motor,
@@ -438,12 +541,22 @@ export default function Home() {
     setMotors(stopped);
     try {
       addLog("tx", "POST /api/stop");
+      const headers: Record<string, string> = {
+        "X-Command-Id": String(commandIdRef.current),
+      };
+      if (!udpRealtimeAvailableRef.current) {
+        headers["X-Control-Transport"] = "http";
+      }
       await requestApi("/api/stop", {
         method: "POST",
-        headers: { "X-Command-Id": String(commandIdRef.current) },
+        headers,
       });
+      if (generation !== commandGenerationRef.current) return;
     } catch (error) {
+      if (generation !== commandGenerationRef.current) return;
       addLog("error", error instanceof Error ? error.message : "停止命令に失敗しました");
+    } finally {
+      commandInFlightRef.current -= 1;
     }
   }
 
@@ -533,20 +646,39 @@ export default function Home() {
                 {deviceInfo.hostname ?? DEFAULT_DEVICE} → {deviceInfo.ip}（
                 {deviceInfo.networkMode === "link-local" ? "PC直結" : "DHCP"}）・
                 FW {deviceInfo.firmwareVersion ?? "unknown"}・
+                UDP RT v{deviceInfo.udpControlProtocol}・
+                UDP cmd {deviceInfo.urgentCommands ?? 0}・
+                keepalive {deviceInfo.safetyKeepalives ?? 0}・
                 API watchdog {deviceInfo.watchdogMs / 1000}s
+                {(deviceInfo.socketCommandTimeouts ?? 0) > 0 &&
+                  `・W5500自動復旧 ${deviceInfo.socketCommandTimeouts}回`}
               </p>
             )}
           </div>
           <div className="deckActions">
             <button
               className="syncRun"
-              onClick={runBothMotors}
+              onPointerDown={(event) => {
+                if (event.button === 0) void runBothMotors();
+              }}
+              onClick={(event) => {
+                if (event.detail === 0) void runBothMotors();
+              }}
               disabled={!connected}
             >
               <span aria-hidden="true">▶▶</span>
               2台同時回転
             </button>
-            <button className="emergency" onClick={emergencyStop} disabled={!connected}>
+            <button
+              className="emergency"
+              onPointerDown={(event) => {
+                if (event.button === 0) void emergencyStop();
+              }}
+              onClick={(event) => {
+                if (event.detail === 0) void emergencyStop();
+              }}
+              disabled={!connected}
+            >
               <span aria-hidden="true">■</span> 2台同時停止
             </button>
           </div>
@@ -612,8 +744,30 @@ export default function Home() {
               </div>
 
               <div className="motorActions">
-                <button className="button run" onClick={() => runMotor(index)} disabled={!connected}>▶ 動作開始</button>
-                <button className="button stop" onClick={() => stopMotor(index)} disabled={!connected}>■ 停止</button>
+                <button
+                  className="button run"
+                  onPointerDown={(event) => {
+                    if (event.button === 0) void runMotor(index);
+                  }}
+                  onClick={(event) => {
+                    if (event.detail === 0) void runMotor(index);
+                  }}
+                  disabled={!connected}
+                >
+                  ▶ 動作開始
+                </button>
+                <button
+                  className="button stop"
+                  onPointerDown={(event) => {
+                    if (event.button === 0) void stopMotor(index);
+                  }}
+                  onClick={(event) => {
+                    if (event.detail === 0) void stopMotor(index);
+                  }}
+                  disabled={!connected}
+                >
+                  ■ 停止
+                </button>
               </div>
             </article>
           ))}
@@ -622,7 +776,7 @@ export default function Home() {
 
       <section className="consoleSection">
         <div className="consoleHeader">
-          <div><span>LIVE HTTP</span><h2>API通信ログ</h2></div>
+          <div><span>LIVE CONTROL</span><h2>制御通信ログ</h2></div>
           <button onClick={() => setLogs([])}>ログを消去</button>
         </div>
         <div className="consoleBody" role="log" aria-live="polite">
@@ -644,7 +798,7 @@ export default function Home() {
       </section>
 
       <footer>
-        <p><b>安全機能</b> 100ms周期の安全信号が0.5秒間途絶えると、Picoがモーターを自動停止します。</p>
+        <p><b>安全機能</b> UDPでは250ms周期、HTTP制御モードでは750ms周期の安全信号を送り、3秒途絶えるとPicoがモーターを自動停止します。</p>
         <p>W5500 <span>•</span> DHCP <span>•</span> mDNS</p>
       </footer>
     </main>

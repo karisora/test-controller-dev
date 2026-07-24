@@ -2,6 +2,7 @@
 
 #include "socket.h"
 #include "W5500/w5500.h"
+#include "pico/time.h"
 
 #include <ctype.h>
 #include <stddef.h>
@@ -11,11 +12,66 @@
 #define MDNS_PORT 5353u
 #define MDNS_BUFFER_SIZE 512u
 #define MDNS_TTL_SECONDS 120u
+#define SOCKET_COMMAND_TIMEOUT_US 2000u
 
 static uint8_t multicast_ip[4] = {224, 0, 0, 251};
 static uint8_t multicast_mac[6] = {0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb};
 static uint8_t encoded_name[64];
 static size_t encoded_name_length;
+
+static bool issue_socket_command(uint8_t command)
+{
+    setSn_CR(MDNS_SOCKET, command);
+    uint64_t deadline = time_us_64() + SOCKET_COMMAND_TIMEOUT_US;
+    while (getSn_CR(MDNS_SOCKET) != 0) {
+        if (time_us_64() >= deadline) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int32_t receive_packet(uint8_t *destination, uint16_t capacity,
+                              uint8_t source_ip[4], uint16_t *source_port)
+{
+    if (getSn_RX_RSR(MDNS_SOCKET) < 8u) {
+        return 0;
+    }
+
+    uint8_t header[8];
+    uint16_t read_pointer = getSn_RX_RD(MDNS_SOCKET);
+    wiz_recv_data(MDNS_SOCKET, header, sizeof(header));
+    read_pointer += sizeof(header);
+    setSn_RX_RD(MDNS_SOCKET, read_pointer);
+
+    memcpy(source_ip, header, 4);
+    *source_port = (uint16_t)header[4] << 8 | header[5];
+    uint16_t packet_length = (uint16_t)header[6] << 8 | header[7];
+    uint16_t copied = packet_length < capacity ? packet_length : capacity;
+    if (copied != 0) {
+        wiz_recv_data(MDNS_SOCKET, destination, copied);
+    }
+    setSn_RX_RD(MDNS_SOCKET, read_pointer + packet_length);
+    return issue_socket_command(Sn_CR_RECV) ? copied : -1;
+}
+
+static bool send_packet(const uint8_t *packet, uint16_t length,
+                        const uint8_t destination_ip[4],
+                        uint16_t destination_port)
+{
+    if (length == 0 || length > getSn_TX_FSR(MDNS_SOCKET)) {
+        return false;
+    }
+    setSn_DIPR(MDNS_SOCKET, destination_ip);
+    setSn_DPORT(MDNS_SOCKET, destination_port);
+    uint8_t pending = getSn_IR(MDNS_SOCKET) &
+                      (Sn_IR_SENDOK | Sn_IR_TIMEOUT);
+    if (pending != 0) {
+        setSn_IR(MDNS_SOCKET, pending);
+    }
+    wiz_send_data(MDNS_SOCKET, (uint8_t *)packet, length);
+    return issue_socket_command(Sn_CR_SEND);
+}
 
 static void write_u16(uint8_t *destination, uint16_t value)
 {
@@ -169,13 +225,18 @@ static bool query_requests_our_address(const uint8_t *packet, size_t length,
 
 static bool open_multicast_socket(void)
 {
-    close(MDNS_SOCKET);
+    if (getSn_SR(MDNS_SOCKET) != SOCK_CLOSED &&
+        !issue_socket_command(Sn_CR_CLOSE)) {
+        return false;
+    }
     setSn_DHAR(MDNS_SOCKET, multicast_mac);
     setSn_DIPR(MDNS_SOCKET, multicast_ip);
     setSn_DPORT(MDNS_SOCKET, MDNS_PORT);
     setSn_TTL(MDNS_SOCKET, 255);
-    return socket(MDNS_SOCKET, Sn_MR_UDP, MDNS_PORT, SF_MULTI_ENABLE) ==
-           MDNS_SOCKET;
+    setSn_MR(MDNS_SOCKET, Sn_MR_UDP | SF_MULTI_ENABLE);
+    setSn_PORT(MDNS_SOCKET, MDNS_PORT);
+    return issue_socket_command(Sn_CR_OPEN) &&
+           getSn_SR(MDNS_SOCKET) == SOCK_UDP;
 }
 
 bool mdns_responder_init(const char *hostname)
@@ -188,7 +249,7 @@ bool mdns_responder_init(const char *hostname)
 
 void mdns_responder_stop(void)
 {
-    close(MDNS_SOCKET);
+    (void)issue_socket_command(Sn_CR_CLOSE);
 }
 
 void mdns_responder_service(const uint8_t ip[4])
@@ -209,10 +270,8 @@ void mdns_responder_service(const uint8_t ip[4])
     uint8_t query[MDNS_BUFFER_SIZE];
     uint8_t source_ip[4];
     uint16_t source_port;
-    uint16_t receive_length =
-        available < sizeof(query) ? available : (uint16_t)sizeof(query);
     int32_t received =
-        recvfrom(MDNS_SOCKET, query, receive_length, source_ip, &source_port);
+        receive_packet(query, sizeof(query), source_ip, &source_port);
     bool unicast_requested = false;
     if (received <= 0 || !query_requests_our_address(
                              query, (size_t)received, &unicast_requested)) {
@@ -238,8 +297,8 @@ void mdns_responder_service(const uint8_t ip[4])
         unicast_requested ? source_ip : multicast_ip;
     uint16_t destination_port =
         unicast_requested ? source_port : MDNS_PORT;
-    if (sendto(MDNS_SOCKET, response, (uint16_t)offset,
-               destination_ip, destination_port) < 0) {
+    if (!send_packet(response, (uint16_t)offset,
+                     destination_ip, destination_port)) {
         // Recreate the UDP socket after a cable pull or W5500 socket error so
         // that the next reconnect attempt can resolve pico-motor.local again.
         open_multicast_socket();

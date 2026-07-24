@@ -2,6 +2,7 @@
 
 #include "dhcp.h"
 #include "hardware/spi.h"
+#include "hardware/watchdog.h"
 #include "mdns_responder.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
@@ -61,7 +62,7 @@
 #define MOTOR_API_KEY ""
 #endif
 #ifndef MOTOR_API_WATCHDOG_MS
-#define MOTOR_API_WATCHDOG_MS 500u
+#define MOTOR_API_WATCHDOG_MS 1000u
 #endif
 #ifndef MOTOR_FIRMWARE_VERSION
 #define MOTOR_FIRMWARE_VERSION "dev"
@@ -78,13 +79,16 @@
 #define URGENT_PORT 5000u
 #define URGENT_PACKET_HEADER_SIZE 25u
 #define URGENT_PACKET_MAX_SIZE 96u
+#define URGENT_ACK_SIZE 24u
 #define DHCP_BUFFER_SIZE 1024u
 #define DHCP_STARTUP_TIMEOUT_US 15000000u
 #define REQUEST_BUFFER_SIZE 2048u
 #define RESPONSE_BUFFER_SIZE 2048u
 #define REQUEST_TIMEOUT_US 2000000u
-#define RESPONSE_CLOSE_TIMEOUT_US 1000000u
+#define RESPONSE_CLOSE_TIMEOUT_US 50000u
 #define HTTP_CLOSE_TIMEOUT_US 250000u
+#define SOCKET_COMMAND_TIMEOUT_US 2000u
+#define W5500_RECOVERY_RETRY_US 250000u
 #define PHY_LINK_CHECK_INTERVAL_US 1000u
 #define MOTOR1_ID 0x100u
 #define MOTOR2_ID 0x101u
@@ -128,6 +132,9 @@ static uint64_t latest_udp_command_id;
 static uint8_t seen_udp_command_sessions[UINT16_MAX / 8u + 1u];
 static uint32_t urgent_commands_accepted;
 static uint32_t safety_keepalives_received;
+static uint32_t socket_command_timeouts;
+static bool w5500_recovery_requested;
+static uint64_t next_w5500_recovery_us;
 
 static bool service_phy_link(void);
 
@@ -143,6 +150,26 @@ static uint64_t read_big_endian_u64(const uint8_t *source)
 {
     return (uint64_t)read_big_endian_u32(source) << 32 |
            read_big_endian_u32(source + 4);
+}
+
+static void write_big_endian_u16(uint8_t *destination, uint16_t value)
+{
+    destination[0] = (uint8_t)(value >> 8);
+    destination[1] = (uint8_t)value;
+}
+
+static void write_big_endian_u32(uint8_t *destination, uint32_t value)
+{
+    destination[0] = (uint8_t)(value >> 24);
+    destination[1] = (uint8_t)(value >> 16);
+    destination[2] = (uint8_t)(value >> 8);
+    destination[3] = (uint8_t)value;
+}
+
+static void write_big_endian_u64(uint8_t *destination, uint64_t value)
+{
+    write_big_endian_u32(destination, (uint32_t)(value >> 32));
+    write_big_endian_u32(destination + 4, (uint32_t)value);
 }
 
 static bool accept_command_id(uint64_t command_id)
@@ -167,15 +194,17 @@ static bool accept_udp_command(uint16_t session_id, uint64_t command_id)
     if (!session_seen) {
         seen_udp_command_sessions[byte_index] |= bit;
         active_udp_command_session = session_id;
-        latest_udp_command_id = command_id;
-        return true;
     }
     if (session_id != active_udp_command_session ||
-        command_id <= latest_udp_command_id) {
+        command_id <= latest_udp_command_id ||
+        command_id <= latest_command_id) {
         return false;
     }
 
     latest_udp_command_id = command_id;
+    // HTTP and UDP carry the same command ID. Sharing the high-water mark
+    // prevents a delayed copy on either transport from undoing a newer action.
+    latest_command_id = command_id;
     return true;
 }
 
@@ -207,6 +236,99 @@ static void reset_chip(void)
     sleep_ms(2);
     gpio_put(W5500_RESET_PIN, 1);
     sleep_ms(100);
+}
+
+static bool issue_socket_command(uint8_t socket_number, uint8_t command)
+{
+    setSn_CR(socket_number, command);
+    uint64_t deadline = time_us_64() + SOCKET_COMMAND_TIMEOUT_US;
+    while (getSn_CR(socket_number) != 0) {
+        if (time_us_64() >= deadline) {
+            ++socket_command_timeouts;
+            w5500_recovery_requested = true;
+            return false;
+        }
+        tight_loop_contents();
+    }
+    return true;
+}
+
+static int32_t receive_tcp_data(uint8_t socket_number, uint8_t *destination,
+                                uint16_t length)
+{
+    if (length == 0) {
+        return 0;
+    }
+    uint16_t read_pointer = getSn_RX_RD(socket_number);
+    wiz_recv_data(socket_number, destination, length);
+    setSn_RX_RD(socket_number, read_pointer + length);
+    return issue_socket_command(socket_number, Sn_CR_RECV) ? length : -1;
+}
+
+static int32_t receive_udp_packet(uint8_t socket_number, uint8_t *destination,
+                                  uint16_t capacity, uint8_t source_ip[4],
+                                  uint16_t *source_port)
+{
+    if (getSn_RX_RSR(socket_number) < 8u) {
+        return 0;
+    }
+
+    uint8_t header[8];
+    uint16_t read_pointer = getSn_RX_RD(socket_number);
+    wiz_recv_data(socket_number, header, sizeof(header));
+    read_pointer += sizeof(header);
+    setSn_RX_RD(socket_number, read_pointer);
+
+    memcpy(source_ip, header, 4);
+    *source_port = (uint16_t)header[4] << 8 | header[5];
+    uint16_t packet_length = (uint16_t)header[6] << 8 | header[7];
+    uint16_t copied = packet_length < capacity ? packet_length : capacity;
+    if (copied != 0) {
+        wiz_recv_data(socket_number, destination, copied);
+    }
+
+    // Advance over the complete datagram, including bytes deliberately
+    // discarded when the caller's buffer is smaller than the packet.
+    setSn_RX_RD(socket_number, read_pointer + packet_length);
+    if (!issue_socket_command(socket_number, Sn_CR_RECV)) {
+        return -1;
+    }
+    return copied;
+}
+
+static bool send_udp_packet(uint8_t socket_number, const uint8_t *packet,
+                            uint16_t length, const uint8_t destination_ip[4],
+                            uint16_t destination_port)
+{
+    if (length == 0 || length > getSn_TX_FSR(socket_number)) {
+        return false;
+    }
+    setSn_DIPR(socket_number, destination_ip);
+    setSn_DPORT(socket_number, destination_port);
+    uint8_t pending =
+        getSn_IR(socket_number) & (Sn_IR_SENDOK | Sn_IR_TIMEOUT);
+    if (pending != 0) {
+        setSn_IR(socket_number, pending);
+    }
+    wiz_send_data(socket_number, (uint8_t *)packet, length);
+    return issue_socket_command(socket_number, Sn_CR_SEND);
+}
+
+static void send_urgent_ack(const uint8_t destination_ip[4],
+                            uint16_t destination_port, uint8_t result,
+                            uint16_t session_id, uint64_t command_id)
+{
+    int32_t motor1 =
+        read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR1_ID);
+    int32_t motor2 =
+        read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR2_ID);
+    uint8_t ack[URGENT_ACK_SIZE] = {'P', 'M', 'O', 'A', 1, result};
+    write_big_endian_u16(ack + 6, session_id);
+    write_big_endian_u64(ack + 8, command_id);
+    write_big_endian_u32(ack + 16, (uint32_t)motor1);
+    write_big_endian_u32(ack + 20, (uint32_t)motor2);
+    (void)send_udp_packet(URGENT_SOCKET, ack, sizeof(ack),
+                          destination_ip, destination_port);
 }
 
 static void format_current_ip(void)
@@ -329,6 +451,9 @@ static bool acquire_network_address(void)
     uint64_t deadline = time_us_64() + DHCP_STARTUP_TIMEOUT_US;
 
     while (time_us_64() < deadline) {
+        // This function is also used after a live cable reconnect, when the
+        // main-loop watchdog is already active.
+        watchdog_update();
         uint8_t link_status = PHY_LINK_OFF;
         if (ctlwizchip(CW_GET_PHYLINK, &link_status) == 0 &&
             link_status != PHY_LINK_ON) {
@@ -528,8 +653,8 @@ static bool queue_http_response(const uint8_t *first, size_t first_length,
         wiz_send_data(active_http_socket, (uint8_t *)second,
                       (uint16_t)second_length);
     }
-    setSn_CR(active_http_socket, Sn_CR_SEND);
-    while (getSn_CR(active_http_socket) != 0) {
+    if (!issue_socket_command(active_http_socket, Sn_CR_SEND)) {
+        return false;
     }
     active_http_connection->response_queued = true;
     return true;
@@ -619,7 +744,7 @@ static void send_status(void)
 {
     int32_t motor1 = read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR1_ID);
     int32_t motor2 = read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR2_ID);
-    char body[440];
+    char body[512];
     snprintf(
         body, sizeof(body),
         "{\"ok\":true,\"ip\":\"%s\","
@@ -631,7 +756,9 @@ static void send_status(void)
         "{\"id\":\"0x101\",\"speed\":%ld,\"running\":%s}],"
         "\"maxSpeed\":%d,\"watchdogMs\":%u,\"apiKeyRequired\":%s,"
         "\"urgentCommands\":%lu,\"safetyKeepalives\":%lu,"
-        "\"udpCommandSession\":%u}",
+        "\"udpCommandSession\":%u,\"udpDiagnosticAck\":true,"
+        "\"udpControlProtocol\":2,"
+        "\"socketCommandTimeouts\":%lu}",
         current_ip_address, dhcp_enabled ? "dhcp" : "link-local",
         (long)motor1, motor1 == 0 ? "false" : "true",
         (long)motor2, motor2 == 0 ? "false" : "true",
@@ -639,7 +766,8 @@ static void send_status(void)
         sizeof(MOTOR_API_KEY) > 1 ? "true" : "false",
         (unsigned long)urgent_commands_accepted,
         (unsigned long)safety_keepalives_received,
-        active_udp_command_session);
+        active_udp_command_session,
+        (unsigned long)socket_command_timeouts);
     send_json(200, "OK", body);
 }
 
@@ -809,10 +937,9 @@ static void reset_http_socket(uint8_t socket_number,
     // ioLibrary close() waits until Sn_SR becomes CLOSED and can block the
     // whole Pico for seconds if a browser disappears mid-handshake. W5500's
     // CLOSE command is immediate, so issue it directly and continue polling.
-    setSn_CR(socket_number, Sn_CR_CLOSE);
-    while (getSn_CR(socket_number) != 0) {
+    if (issue_socket_command(socket_number, Sn_CR_CLOSE)) {
+        setSn_IR(socket_number, 0xff);
     }
-    setSn_IR(socket_number, 0xff);
     reset_request(connection);
     connection->previous_state = 0xffu;
     connection->state_started_us = time_us_64();
@@ -822,18 +949,14 @@ static bool open_http_socket(uint8_t socket_number)
 {
     setSn_MR(socket_number, Sn_MR_TCP);
     setSn_PORT(socket_number, HTTP_PORT);
-    setSn_CR(socket_number, Sn_CR_OPEN);
-    while (getSn_CR(socket_number) != 0) {
-    }
-    return getSn_SR(socket_number) == SOCK_INIT;
+    return issue_socket_command(socket_number, Sn_CR_OPEN) &&
+           getSn_SR(socket_number) == SOCK_INIT;
 }
 
 static bool listen_http_socket(uint8_t socket_number)
 {
-    setSn_CR(socket_number, Sn_CR_LISTEN);
-    while (getSn_CR(socket_number) != 0) {
-    }
-    return getSn_SR(socket_number) == SOCK_LISTEN;
+    return issue_socket_command(socket_number, Sn_CR_LISTEN) &&
+           getSn_SR(socket_number) == SOCK_LISTEN;
 }
 
 static void begin_passive_http_disconnect(
@@ -841,9 +964,7 @@ static void begin_passive_http_disconnect(
 {
     // CLOSE_WAIT means the browser has already sent FIN. Reply with FIN
     // without calling ioLibrary disconnect(), which waits synchronously.
-    setSn_CR(socket_number, Sn_CR_DISCON);
-    while (getSn_CR(socket_number) != 0) {
-    }
+    (void)issue_socket_command(socket_number, Sn_CR_DISCON);
     reset_request(connection);
     connection->previous_state = 0xffu;
     connection->state_started_us = time_us_64();
@@ -855,6 +976,45 @@ static void reset_all_http_sockets(void)
         reset_http_socket(HTTP_SOCKET_FIRST + index,
                           &http_connections[index]);
     }
+}
+
+static bool recover_w5500(void)
+{
+    uint64_t now = time_us_64();
+    if (!w5500_recovery_requested || now < next_w5500_recovery_us) {
+        return !w5500_recovery_requested;
+    }
+    next_w5500_recovery_us = now + W5500_RECOVERY_RETRY_US;
+
+    // A stuck socket command means command delivery and heartbeats are no
+    // longer trustworthy. Stop first, then reset only the Ethernet controller;
+    // PIO state machines and the Pico itself do not need to be rebooted.
+    if (command_motors != NULL) {
+        command_motors(0, 0);
+    }
+    printf("W5500 socket command timeout: recovering (count=%lu)\r\n",
+           (unsigned long)socket_command_timeouts);
+
+    reset_chip();
+    uint8_t tx_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
+    uint8_t rx_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
+    if (wizchip_init(tx_sizes, rx_sizes) != 0 || getVERSIONR() != 0x04) {
+        printf("W5500 recovery failed; retrying\r\n");
+        return false;
+    }
+
+    ctlnetwork(CN_SET_NETINFO, &current_network);
+    for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
+        reset_request(&http_connections[index]);
+        http_connections[index].previous_state = 0xffu;
+        http_connections[index].state_started_us = 0;
+    }
+    active_http_connection = NULL;
+    phy_link_initialized = false;
+    next_phy_link_check_us = 0;
+    w5500_recovery_requested = false;
+    printf("W5500 recovery complete at %s\r\n", current_ip_address);
+    return true;
 }
 
 static bool service_phy_link(void)
@@ -931,8 +1091,13 @@ static void service_dhcp(void)
 static void service_urgent_commands(void)
 {
     if (getSn_SR(URGENT_SOCKET) != SOCK_UDP) {
-        close(URGENT_SOCKET);
-        socket(URGENT_SOCKET, Sn_MR_UDP, URGENT_PORT, 0);
+        if (getSn_SR(URGENT_SOCKET) != SOCK_CLOSED &&
+            !issue_socket_command(URGENT_SOCKET, Sn_CR_CLOSE)) {
+            return;
+        }
+        setSn_MR(URGENT_SOCKET, Sn_MR_UDP);
+        setSn_PORT(URGENT_SOCKET, URGENT_PORT);
+        (void)issue_socket_command(URGENT_SOCKET, Sn_CR_OPEN);
         return;
     }
 
@@ -944,14 +1109,15 @@ static void service_urgent_commands(void)
     uint8_t packet[URGENT_PACKET_MAX_SIZE];
     uint8_t source_ip[4];
     uint16_t source_port;
-    uint16_t receive_length =
-        available < sizeof(packet) ? available : (uint16_t)sizeof(packet);
-    int32_t received = recvfrom(URGENT_SOCKET, packet, receive_length,
-                                source_ip, &source_port);
-    (void)source_ip;
-    (void)source_port;
+    int32_t received =
+        receive_udp_packet(URGENT_SOCKET, packet, sizeof(packet),
+                           source_ip, &source_port);
     if (received < (int32_t)URGENT_PACKET_HEADER_SIZE ||
-        memcmp(packet, "PMOT", 4) != 0 || packet[4] != 1) {
+        memcmp(packet, "PMOT", 4) != 0) {
+        return;
+    }
+    uint8_t protocol_version = packet[4];
+    if (protocol_version != 1 && protocol_version != 2) {
         return;
     }
 
@@ -998,23 +1164,49 @@ static void service_urgent_commands(void)
         return;
     }
 
-    if (!accept_udp_command(command_session, command_id)) {
-        return;
+    bool accepted = accept_udp_command(command_session, command_id);
+    bool applied = true;
+    if (accepted && valid_stop) {
+        if (command_motors != NULL) {
+            applied = command_motors(0, 0);
+        } else {
+            applied = false;
+        }
+    } else if (accepted && valid_pair) {
+        if (command_motors != NULL) {
+            applied = command_motors(motor1_speed, speed);
+        } else {
+            applied = false;
+        }
+    } else if (accepted) {
+        if (command_motor != NULL) {
+            applied = command_motor(motor_id, speed);
+        } else {
+            applied = false;
+        }
+    }
+    if (accepted) {
+        ++urgent_commands_accepted;
     }
 
-    ++urgent_commands_accepted;
-    if (valid_stop) {
-        if (command_motors != NULL) {
-            command_motors(0, 0);
-        }
-    } else if (valid_pair) {
-        if (command_motors != NULL) {
-            command_motors(motor1_speed, speed);
-        }
+    uint8_t ack_result;
+    if (accepted) {
+        ack_result = applied ? 0u : 2u;
     } else {
-        if (command_motor != NULL) {
-            command_motor(motor_id, speed);
-        }
+        // Repeated copies of the newest id are successful idempotent retries.
+        // Older or foreign-session commands are explicitly reported as stale.
+        ack_result =
+            command_session == active_udp_command_session &&
+                    command_id == latest_command_id
+                ? 0u
+                : 1u;
+    }
+    // Protocol v1 keeps the diagnostic request/ACK behavior for older tools.
+    // The real-time v2 path is deliberately one-way, so applying a command
+    // never waits on or produces confirmation traffic.
+    if (protocol_version == 1) {
+        send_urgent_ack(source_ip, source_port, ack_result,
+                        command_session, command_id);
     }
 }
 
@@ -1026,6 +1218,9 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
     command_motors = pair_callback;
     read_motor_speed = status_callback;
     active_http_connection = NULL;
+    socket_command_timeouts = 0;
+    w5500_recovery_requested = false;
+    next_w5500_recovery_us = 0;
     for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
         reset_request(&http_connections[index]);
         http_connections[index].previous_state = 0xffu;
@@ -1128,7 +1323,10 @@ static void service_http_socket(uint8_t socket_number,
                 }
                 if (now - connection->response_sent_us >=
                     RESPONSE_CLOSE_TIMEOUT_US) {
-                    reset_http_socket(socket_number, connection);
+                    // SENDOK can occasionally be missed even though the short
+                    // LAN response has left the TX buffer. Begin a graceful
+                    // close instead of occupying this listener for one second.
+                    begin_passive_http_disconnect(socket_number, connection);
                 }
                 break;
             }
@@ -1152,10 +1350,11 @@ static void service_http_socket(uint8_t socket_number,
                     break;
                 }
                 int32_t received =
-                    recv(socket_number,
-                         (uint8_t *)connection->request_buffer +
-                             connection->request_length,
-                         chunk);
+                    receive_tcp_data(
+                        socket_number,
+                        (uint8_t *)connection->request_buffer +
+                            connection->request_length,
+                        chunk);
                 if (received > 0) {
                     connection->request_length += (size_t)received;
                     connection->request_buffer[connection->request_length] =
@@ -1217,16 +1416,28 @@ static void service_http_socket(uint8_t socket_number,
 
 void w5500_ethernet_service(void)
 {
+    if (w5500_recovery_requested) {
+        (void)recover_w5500();
+        return;
+    }
     if (!service_phy_link()) {
         return;
     }
 
     service_dhcp();
     service_urgent_commands();
+    if (w5500_recovery_requested) {
+        (void)recover_w5500();
+        return;
+    }
 
     for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
         service_http_socket(HTTP_SOCKET_FIRST + index,
                             &http_connections[index]);
+        if (w5500_recovery_requested) {
+            (void)recover_w5500();
+            return;
+        }
     }
 
     if (mdns_started) {

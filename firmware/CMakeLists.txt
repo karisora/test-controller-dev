@@ -50,9 +50,9 @@ target_include_directories(pico_lan_stepper PRIVATE
 target_compile_definitions(pico_lan_stepper PRIVATE
   _WIZCHIP_=W5500
   MAX_SPEED_STEPS_PER_SEC=20000
-  MOTOR_API_WATCHDOG_MS=500
+  MOTOR_API_WATCHDOG_MS=3000
   MOTOR_HOSTNAME="pico-motor"
-  MOTOR_FIRMWARE_VERSION="2026.07.24.14"
+  MOTOR_FIRMWARE_VERSION="2026.07.25.21"
 )
 
 target_link_libraries(pico_lan_stepper
@@ -61,6 +61,7 @@ target_link_libraries(pico_lan_stepper
   hardware_clocks
   hardware_pio
   hardware_spi
+  hardware_watchdog
 )
 
 pico_enable_stdio_usb(pico_lan_stepper 1)

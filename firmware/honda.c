@@ -1,5 +1,6 @@
 #include "hardware/clocks.h"
 #include "hardware/pio.h"
+#include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 #include "stepper.pio.h"
 #include "w5500_ethernet.h"
@@ -27,9 +28,10 @@
 #define RX_LINE_SIZE 64u
 #define STEPPER_PIO_CLOCK_HZ 1000000u
 #define STEPPER_PIO_FIXED_CYCLES 5u
+#define MAIN_LOOP_WATCHDOG_MS 2000u
 
 #ifndef MOTOR_API_WATCHDOG_MS
-#define MOTOR_API_WATCHDOG_MS 500u
+#define MOTOR_API_WATCHDOG_MS 1000u
 #endif
 
 typedef struct {
@@ -62,7 +64,7 @@ static void stop_step_output(stepper_t *motor)
                               1u << motor->step_pin);
 }
 
-static void start_step_output(stepper_t *motor, uint32_t steps_per_second)
+static bool queue_step_output(stepper_t *motor, uint32_t steps_per_second)
 {
     uint32_t period_cycles = STEPPER_PIO_CLOCK_HZ / steps_per_second;
     uint32_t delay_cycles =
@@ -70,9 +72,23 @@ static void start_step_output(stepper_t *motor, uint32_t steps_per_second)
             ? period_cycles - STEPPER_PIO_FIXED_CYCLES
             : 0;
 
+    // The FIFO has just been cleared by stop_step_output(). Never let a
+    // corrupted/unexpected PIO state block the network service loop forever.
+    if (pio_sm_is_tx_fifo_full(motor->pio, motor->state_machine)) {
+        return false;
+    }
+    pio_sm_put(motor->pio, motor->state_machine, delay_cycles);
+    return true;
+}
+
+static bool start_step_output(stepper_t *motor, uint32_t steps_per_second)
+{
     stop_step_output(motor);
-    pio_sm_put_blocking(motor->pio, motor->state_machine, delay_cycles);
+    if (!queue_step_output(motor, steps_per_second)) {
+        return false;
+    }
     pio_sm_set_enabled(motor->pio, motor->state_machine, true);
+    return true;
 }
 
 static uint32_t normalize_speed(int32_t *signed_speed)
@@ -88,22 +104,13 @@ static uint32_t normalize_speed(int32_t *signed_speed)
     return (uint32_t)magnitude;
 }
 
-static void queue_step_output(stepper_t *motor, uint32_t steps_per_second)
-{
-    uint32_t period_cycles = STEPPER_PIO_CLOCK_HZ / steps_per_second;
-    uint32_t delay_cycles =
-        period_cycles > STEPPER_PIO_FIXED_CYCLES
-            ? period_cycles - STEPPER_PIO_FIXED_CYCLES
-            : 0;
-    pio_sm_put_blocking(motor->pio, motor->state_machine, delay_cycles);
-}
-
-static void set_motor_pair_speed(int32_t motor1_speed, int32_t motor2_speed,
+static bool set_motor_pair_speed(int32_t motor1_speed, int32_t motor2_speed,
                                  uint32_t timeout_ms)
 {
     int32_t requested[] = {motor1_speed, motor2_speed};
     uint64_t now = time_us_64();
     uint32_t enable_mask = 0;
+    bool prepared = true;
 
     for (size_t index = 0; index < count_of(motors); ++index) {
         stepper_t *motor = &motors[index];
@@ -137,19 +144,35 @@ static void set_motor_pair_speed(int32_t motor1_speed, int32_t motor2_speed,
         motor->speed_steps_per_sec = magnitude;
         motor->stop_deadline_us =
             timeout_ms == 0 ? 0 : now + (uint64_t)timeout_ms * 1000u;
-        queue_step_output(motor, magnitude);
+        if (!queue_step_output(motor, magnitude)) {
+            prepared = false;
+            break;
+        }
         enable_mask |= 1u << motor->state_machine;
     }
 
+    if (!prepared) {
+        // A synchronized command must never leave only one motor running.
+        for (size_t index = 0; index < count_of(motors); ++index) {
+            stop_step_output(&motors[index]);
+            gpio_put(motors[index].led_pin, 0);
+            motors[index].signed_speed = 0;
+            motors[index].speed_steps_per_sec = 0;
+            motors[index].stop_deadline_us = 0;
+        }
+        printf("PIO FIFO error: all motors stopped\r\n");
+        return false;
+    }
     if (enable_mask != 0) {
         sleep_us(DIR_SETUP_US);
         // Both PIO state machines in the mask are enabled by one register
         // write, so their first STEP edge starts on the same Pico clock.
         pio_set_sm_mask_enabled(pio0, enable_mask, true);
     }
+    return true;
 }
 
-static void set_motor_speed(stepper_t *motor, int32_t signed_speed,
+static bool set_motor_speed(stepper_t *motor, int32_t signed_speed,
                             uint32_t timeout_ms)
 {
     bool direction = signed_speed >= 0;
@@ -163,7 +186,7 @@ static void set_motor_speed(stepper_t *motor, int32_t signed_speed,
         motor->signed_speed = 0;
         motor->speed_steps_per_sec = 0;
         motor->stop_deadline_us = 0;
-        return;
+        return true;
     }
 
     uint64_t now = time_us_64();
@@ -172,7 +195,7 @@ static void set_motor_speed(stepper_t *motor, int32_t signed_speed,
         // 同じ速度の再送はパルスを途切れさせず、安全停止期限だけ更新する。
         motor->stop_deadline_us =
             timeout_ms == 0 ? 0 : now + (uint64_t)timeout_ms * 1000u;
-        return;
+        return true;
     }
 
     stop_step_output(motor);
@@ -183,13 +206,21 @@ static void set_motor_speed(stepper_t *motor, int32_t signed_speed,
     motor->speed_steps_per_sec = (uint32_t)magnitude;
     motor->stop_deadline_us =
         timeout_ms == 0 ? 0 : now + (uint64_t)timeout_ms * 1000u;
-    start_step_output(motor, motor->speed_steps_per_sec);
+    if (!start_step_output(motor, motor->speed_steps_per_sec)) {
+        gpio_put(motor->led_pin, 0);
+        motor->signed_speed = 0;
+        motor->speed_steps_per_sec = 0;
+        motor->stop_deadline_us = 0;
+        printf("PIO FIFO error: motor stopped\r\n");
+        return false;
+    }
+    return true;
 }
 
 static void service_motor(stepper_t *motor, uint64_t now_us)
 {
     if (motor->stop_deadline_us != 0 && now_us >= motor->stop_deadline_us) {
-        set_motor_speed(motor, 0, 0);
+        (void)set_motor_speed(motor, 0, 0);
         printf("SAFE STOP: API command timeout\r\n");
         return;
     }
@@ -257,8 +288,7 @@ static bool execute_motor_command(uint32_t id, int32_t data, uint32_t timeout_ms
     if (motor == NULL) {
         return false;
     }
-    set_motor_speed(motor, data, timeout_ms);
-    return true;
+    return set_motor_speed(motor, data, timeout_ms);
 }
 
 static bool execute_api_command(uint32_t id, int32_t data)
@@ -278,12 +308,13 @@ static bool execute_api_pair_command(int32_t motor1_speed,
     bool changed =
         motors[0].signed_speed != motor1_speed ||
         motors[1].signed_speed != motor2_speed;
-    set_motor_pair_speed(motor1_speed, motor2_speed, MOTOR_API_WATCHDOG_MS);
-    if (changed) {
+    bool accepted =
+        set_motor_pair_speed(motor1_speed, motor2_speed, MOTOR_API_WATCHDOG_MS);
+    if (accepted && changed) {
         printf("API SYNC OK %ld,%ld\r\n",
                (long)motor1_speed, (long)motor2_speed);
     }
-    return true;
+    return accepted;
 }
 
 static int32_t read_api_motor_speed(uint32_t id)
@@ -359,6 +390,12 @@ int main(void)
         gpio_put(motors[i].led_pin, 0);
     }
 
+    // Last-resort containment for third-party network-library calls: any
+    // unexpected main-loop stall resets the Pico and de-energizes STEP output
+    // instead of leaving the controller permanently unreachable.
+    watchdog_enable(MAIN_LOOP_WATCHDOG_MS, true);
+    watchdog_update();
+
     bool ethernet_ready =
         w5500_ethernet_init(execute_api_command, execute_api_pair_command,
                             read_api_motor_speed);
@@ -369,8 +406,8 @@ int main(void)
     } else {
         printf("W5500 init failed; USB control remains available\r\n");
     }
-
     while (true) {
+        watchdog_update();
         service_usb_input();
 
         uint64_t now_us = time_us_64();
@@ -381,6 +418,7 @@ int main(void)
         if (ethernet_ready) {
             w5500_ethernet_service();
         }
+        watchdog_update();
 
         now_us = time_us_64();
         for (size_t i = 0; i < count_of(motors); ++i) {

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import dgram from "node:dgram";
 import { request as httpRequest } from "node:http";
@@ -13,12 +14,24 @@ type RouteContext = {
 
 const MDNS_ADDRESS = "224.0.0.251";
 const MDNS_PORT = 5353;
+const URGENT_COMMAND_PORT = 5000;
+const URGENT_PACKET_HEADER_SIZE = 25;
 const DISCOVERY_TIMEOUT_MS = 1500;
 const DNS_TIMEOUT_MS = 1200;
-const UPSTREAM_TIMEOUT_MS = 2000;
+const UPSTREAM_TIMEOUT_MS = 1600;
+const URGENT_TIMEOUT_MS = 450;
+const URGENT_PARALLEL_REQUESTS = 3;
+const URGENT_RETRY_ROUNDS = 3;
 const ADDRESS_CACHE_MS = 30000;
+const SAME_ADDRESS_ATTEMPTS = 4;
+const REFRESHED_ADDRESS_ATTEMPTS = 2;
+const RETRY_DELAY_MS = 75;
 const DEFAULT_PICO_HOSTNAME = "pico-motor.local";
 const LINK_LOCAL_FALLBACK = "169.254.50.50";
+const COMMAND_SESSION_ID = (() => {
+  const value = randomBytes(2).readUInt16BE(0);
+  return value === 0 ? 1 : value;
+})();
 
 type AddressCacheEntry = {
   address: string;
@@ -27,6 +40,112 @@ type AddressCacheEntry = {
 
 const addressCache = new Map<string, AddressCacheEntry>();
 const addressResolution = new Map<string, Promise<string>>();
+
+function encodeUrgentCommand(
+  path: string,
+  body: string | undefined,
+  apiKey: string,
+  commandId: string | null,
+) {
+  const heartbeat = path === "api/heartbeat";
+  if (!heartbeat && (!commandId || !/^[1-9]\d{0,19}$/.test(commandId))) {
+    throw new Error("操作命令IDが不正です");
+  }
+  const key = Buffer.from(apiKey, "utf8");
+  if (key.length > 64) throw new Error("APIキーが長すぎます");
+
+  let type = heartbeat ? 2 : 0;
+  let motorId = 0;
+  let speed = 0;
+  if (path === "api/motors/sync") {
+    type = 3;
+    const parsed = JSON.parse(body ?? "{}") as {
+      speed1?: unknown;
+      speed2?: unknown;
+    };
+    if (
+      [parsed.speed1, parsed.speed2].some(
+        (value) =>
+          !Number.isInteger(value) ||
+          (value as number) < -20000 ||
+          (value as number) > 20000,
+      )
+    ) {
+      throw new Error("2台分の速度指定が不正です");
+    }
+    motorId = parsed.speed1 as number;
+    speed = parsed.speed2 as number;
+  }
+  if (path === "api/motors/1" || path === "api/motors/2") {
+    type = 1;
+    motorId = path.endsWith("/1") ? 0x100 : 0x101;
+    const parsed = JSON.parse(body ?? "{}") as { speed?: unknown };
+    if (
+      !Number.isInteger(parsed.speed) ||
+      (parsed.speed as number) < -20000 ||
+      (parsed.speed as number) > 20000
+    ) {
+      throw new Error("速度指定が不正です");
+    }
+    speed = parsed.speed as number;
+  }
+
+  const packet = Buffer.alloc(URGENT_PACKET_HEADER_SIZE + key.length);
+  packet.write("PMOT", 0, "ascii");
+  packet[4] = 1;
+  packet[5] = type;
+  packet.writeUInt16BE(heartbeat ? 0 : COMMAND_SESSION_ID, 6);
+  packet.writeBigUInt64BE(
+    heartbeat ? BigInt(0) : BigInt(commandId as string),
+    8,
+  );
+  if (type === 3) packet.writeInt32BE(motorId, 16);
+  else packet.writeUInt32BE(motorId, 16);
+  packet.writeInt32BE(speed, 20);
+  packet[24] = key.length;
+  key.copy(packet, URGENT_PACKET_HEADER_SIZE);
+  return packet;
+}
+
+function sendUrgentCommand(
+  address: string,
+  packet: Buffer,
+) {
+  return new Promise<void>((resolve, reject) => {
+    const socket = dgram.createSocket("udp4");
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch {
+        // A bind error can occur before the UDP socket becomes closable.
+      }
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error("Pico即時命令がタイムアウトしました")),
+      URGENT_TIMEOUT_MS,
+    );
+    socket.once("error", finish);
+    socket.bind(0, localAddressFor(address), () => {
+      let remaining = URGENT_PARALLEL_REQUESTS;
+      for (let copy = 0; copy < URGENT_PARALLEL_REQUESTS; copy += 1) {
+        socket.send(packet, URGENT_COMMAND_PORT, address, (error) => {
+          if (error) {
+            finish(error);
+            return;
+          }
+          remaining -= 1;
+          if (remaining === 0) finish();
+        });
+      }
+    });
+  });
+}
 
 function jsonError(message: string, status: number) {
   return Response.json({ ok: false, error: message }, { status });
@@ -278,7 +397,8 @@ async function resolvePrivateAddress(hostname: string, forceRefresh = false) {
   }
 
   if (forceRefresh) {
-    addressCache.delete(key);
+    // Keep the last known address available to safety and motor UDP packets
+    // while the slower mDNS/DNS refresh runs in parallel.
   } else {
     const cached = addressCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
@@ -307,10 +427,17 @@ function endpointAllowed(method: string, path: string) {
   if (method === "GET" && (path === "api/status" || path === "api/health")) {
     return true;
   }
-  if (method === "POST" && path === "api/stop") return true;
+  if (
+    method === "POST" &&
+    (path === "api/stop" || path === "api/heartbeat")
+  ) {
+    return true;
+  }
   return (
     (method === "PUT" || method === "POST") &&
-    (path === "api/motors/1" || path === "api/motors/2")
+    (path === "api/motors/1" ||
+      path === "api/motors/2" ||
+      path === "api/motors/sync")
   );
 }
 
@@ -320,6 +447,7 @@ function requestPico(
   method: string,
   headers: Record<string, string>,
   body: string | undefined,
+  timeoutMs = UPSTREAM_TIMEOUT_MS,
 ) {
   return new Promise<{
     status: number;
@@ -358,13 +486,74 @@ function requestPico(
         response.on("error", reject);
       },
     );
-    request.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    request.setTimeout(timeoutMs, () => {
       request.destroy(new Error("PicoのHTTP応答がタイムアウトしました"));
     });
     request.on("error", reject);
     if (body) request.write(body);
     request.end();
   });
+}
+
+async function requestPicoUrgent(
+  address: string,
+  path: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string | undefined,
+) {
+  let lastError: unknown;
+  for (let round = 0; round < URGENT_RETRY_ROUNDS; round += 1) {
+    try {
+      // W5500 has four HTTP listener sockets. Sending the same idempotent
+      // command to three of them avoids waiting for a socket that is still
+      // completing an older TCP close. X-Command-Id makes late copies stale.
+      return await Promise.any(
+        Array.from({ length: URGENT_PARALLEL_REQUESTS }, () =>
+          requestPico(
+            address,
+            path,
+            method,
+            headers,
+            body,
+            URGENT_TIMEOUT_MS,
+          ),
+        ),
+      );
+    } catch (error) {
+      lastError = error;
+      if (round + 1 < URGENT_RETRY_ROUNDS) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Picoへ緊急命令を送信できませんでした");
+}
+
+async function requestPicoWithRetries(
+  address: string,
+  path: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string | undefined,
+  attempts: number,
+) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await requestPico(address, path, method, headers, body);
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Picoへ接続できませんでした");
 }
 
 async function proxyRequest(request: Request, context: RouteContext) {
@@ -395,26 +584,98 @@ async function proxyRequest(request: Request, context: RouteContext) {
     };
     const contentType = request.headers.get("content-type");
     const apiKey = request.headers.get("x-api-key");
+    const commandId = request.headers.get("x-command-id");
     if (contentType) headers["Content-Type"] = contentType;
     if (apiKey) headers["X-API-Key"] = apiKey;
+    if (commandId) headers["X-Command-Id"] = commandId;
 
     const body =
       request.method === "GET" || request.method === "HEAD"
         ? undefined
         : await request.text();
-    const fetchUpstream = async (address: string) => {
-      return requestPico(address, path, request.method, headers, body);
-    };
+    const urgent =
+      path === "api/stop" ||
+      path === "api/motors/1" ||
+      path === "api/motors/2" ||
+      path === "api/motors/sync";
+    const heartbeat = path === "api/heartbeat";
+    const fetchUpstream = async (address: string) =>
+      urgent
+        ? requestPicoUrgent(
+            address,
+            path,
+            request.method,
+            headers,
+            body,
+          )
+        : requestPicoWithRetries(
+            address,
+            path,
+            request.method,
+            headers,
+            body,
+            SAME_ADDRESS_ATTEMPTS,
+          );
 
-    let address = await resolvePrivateAddress(target.hostname);
+    // A safety heartbeat must never pause for mDNS. The normal connection or
+    // status request has already cached the resolved address; keep using that
+    // address until a status/reconnect request discovers a replacement.
+    const cachedAddress = addressCache.get(target.hostname.toLowerCase());
+    let address =
+      (heartbeat || urgent) && cachedAddress
+        ? cachedAddress.address
+        : await resolvePrivateAddress(target.hostname);
+    if (heartbeat) {
+      const packet = encodeUrgentCommand(
+        path,
+        undefined,
+        apiKey ?? "",
+        null,
+      );
+      await sendUrgentCommand(address, packet);
+      return Response.json(
+        { ok: true, transport: "udp" },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    if (urgent && commandId) {
+      const packet = encodeUrgentCommand(
+        path,
+        body,
+        apiKey ?? "",
+        commandId,
+      );
+      // Motor commands complete on the low-latency UDP path. A separate status
+      // poll confirms the resulting state without delaying the next operation.
+      await sendUrgentCommand(address, packet);
+      return Response.json(
+        { ok: true, transport: "udp" },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
     let upstream;
     try {
       upstream = await fetchUpstream(address);
     } catch {
       // The Pico may have rebooted or received a new DHCP address. Discard both
-      // the address cache and the failed TCP connection, then resolve and retry.
+      // the address cache after retrying the known LAN path, then resolve again.
       address = await resolvePrivateAddress(target.hostname, true);
-      upstream = await fetchUpstream(address);
+      upstream = urgent
+        ? await requestPicoUrgent(
+            address,
+            path,
+            request.method,
+            headers,
+            body,
+          )
+        : await requestPicoWithRetries(
+            address,
+            path,
+            request.method,
+            headers,
+            body,
+            REFRESHED_ADDRESS_ATTEMPTS,
+          );
     }
     return new Response(upstream.text, {
       status: upstream.status,

@@ -37,9 +37,10 @@ type ApiStatus = {
 
 const MAX_SPEED = 20000;
 const DEFAULT_DEVICE = "pico-motor.local";
-const HEARTBEAT_MS = 300;
-const API_TIMEOUT_MS = 8000;
+const HEARTBEAT_MS = 100;
+const API_TIMEOUT_MS = 12000;
 const RECONNECT_DELAY_MS = 2000;
+const STATUS_FAILURE_LIMIT = 3;
 
 function nowLabel() {
   return new Intl.DateTimeFormat("ja-JP", {
@@ -69,8 +70,8 @@ export default function Home() {
   const [reconnectEnabled, setReconnectEnabled] = useState(false);
   const [deviceInfo, setDeviceInfo] = useState<ApiStatus | null>(null);
   const [motors, setMotors] = useState<MotorState[]>([
-    { id: "0x100", speed: 800, direction: 1, running: false },
-    { id: "0x101", speed: 800, direction: 1, running: false },
+    { id: "0x100", speed: 500, direction: 1, running: false },
+    { id: "0x101", speed: 500, direction: 1, running: false },
   ]);
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [rawCommand, setRawCommand] = useState("");
@@ -80,10 +81,14 @@ export default function Home() {
   const connectedRef = useRef(connected);
   const activeBaseUrlRef = useRef("");
   const apiKeyRef = useRef(apiKey);
-  const requestChainRef = useRef<Promise<void>>(Promise.resolve());
+  const commandGenerationRef = useRef(0);
+  const commandIdRef = useRef(0);
+  const syncRunTokenRef = useRef(0);
   const connectingRef = useRef(false);
   const statusPollInFlightRef = useRef(false);
   const heartbeatInFlightRef = useRef(false);
+  const statusFailureCountRef = useRef(0);
+  const heartbeatFailureCountRef = useRef(0);
 
   useEffect(() => {
     motorsRef.current = motors;
@@ -168,33 +173,43 @@ export default function Home() {
           return status;
         } catch (error) {
           if (error instanceof DOMException && error.name === "AbortError") {
-            throw new Error("Picoから8秒以内に応答がありません");
+            throw new Error("Picoから12秒以内に応答がありません");
           }
           throw error;
         } finally {
           window.clearTimeout(timeout);
         }
       };
-      const result = requestChainRef.current.then(run, run);
-      requestChainRef.current = result.then(() => undefined, () => undefined);
-      return result;
+      return run();
     },
     [addLog, deviceAddress],
   );
 
   const disconnect = useCallback(async () => {
     setReconnectEnabled(false);
+    syncRunTokenRef.current += 1;
+    commandGenerationRef.current += 1;
+    commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
     const wasConnected = connectedRef.current;
     connectedRef.current = false;
     if (wasConnected && motorsRef.current.some((motor) => motor.running)) {
       try {
-        await requestApi("/api/stop", { method: "POST" }, true);
+        await requestApi(
+          "/api/stop",
+          {
+            method: "POST",
+            headers: { "X-Command-Id": String(commandIdRef.current) },
+          },
+          true,
+        );
         addLog("info", "切断前に全モーターを停止しました");
       } catch {
         addLog("error", "停止確認に失敗しました。Pico側ウォッチドッグで自動停止します");
       }
     }
     activeBaseUrlRef.current = "";
+    statusFailureCountRef.current = 0;
+    heartbeatFailureCountRef.current = 0;
     connectedRef.current = false;
     setConnected(false);
     setDeviceInfo(null);
@@ -213,6 +228,8 @@ export default function Home() {
       window.localStorage.setItem("pico-api-key", apiKey);
       const status = await requestApi("/api/status");
       applyStatus(status);
+      statusFailureCountRef.current = 0;
+      heartbeatFailureCountRef.current = 0;
       connectedRef.current = true;
       setConnected(true);
       addLog(
@@ -251,10 +268,18 @@ export default function Home() {
     const timer = window.setInterval(async () => {
       if (statusPollInFlightRef.current) return;
       statusPollInFlightRef.current = true;
+      const generation = commandGenerationRef.current;
       try {
         const status = await requestApi("/api/status", {}, true);
-        applyStatus(status);
+        statusFailureCountRef.current = 0;
+        if (generation === commandGenerationRef.current) {
+          applyStatus(status);
+        }
       } catch (error) {
+        if (generation !== commandGenerationRef.current) return;
+        statusFailureCountRef.current += 1;
+        if (statusFailureCountRef.current < STATUS_FAILURE_LIMIT) return;
+        statusFailureCountRef.current = 0;
         connectedRef.current = false;
         setConnected(false);
         setDeviceInfo(null);
@@ -275,23 +300,23 @@ export default function Home() {
     const timer = window.setInterval(async () => {
       if (heartbeatInFlightRef.current || !connectedRef.current) return;
       heartbeatInFlightRef.current = true;
-      const running = motorsRef.current
-        .map((motor, index) => ({ motor, index }))
-        .filter(({ motor }) => motor.running);
+      const generation = commandGenerationRef.current;
       try {
-        for (const { motor, index } of running) {
-          const speed = motor.speed * motor.direction;
-          await requestApi(
-            `/api/motors/${index + 1}`,
-            { method: "PUT", body: JSON.stringify({ speed }) },
-            true,
+        await requestApi(
+          "/api/heartbeat",
+          { method: "POST" },
+          true,
+        );
+        heartbeatFailureCountRef.current = 0;
+      } catch (error) {
+        if (generation !== commandGenerationRef.current) return;
+        heartbeatFailureCountRef.current += 1;
+        if (heartbeatFailureCountRef.current === 1) {
+          addLog(
+            "error",
+            `安全信号の送信失敗: ${error instanceof Error ? error.message : "通信エラー"}`,
           );
         }
-      } catch (error) {
-        addLog(
-          "error",
-          `ウォッチドッグ更新失敗: ${error instanceof Error ? error.message : "通信エラー"}`,
-        );
       } finally {
         heartbeatInFlightRef.current = false;
       }
@@ -307,18 +332,41 @@ export default function Home() {
     );
   }
 
-  async function setRemoteMotor(index: number, speed: number) {
+  function applyOptimisticMotor(index: number, speed: number) {
+    const next = motorsRef.current.map((motor, motorIndex) =>
+      motorIndex === index
+        ? {
+            ...motor,
+            running: speed !== 0,
+            direction:
+              speed === 0 ? motor.direction : (speed < 0 ? -1 : 1) as 1 | -1,
+            speed: speed === 0 ? motor.speed : Math.abs(speed),
+          }
+        : motor,
+    );
+    motorsRef.current = next;
+    setMotors(next);
+  }
+
+  async function setRemoteMotor(
+    index: number,
+    speed: number,
+  ) {
     if (!connectedRef.current) {
       addLog("error", "先にPicoへLAN接続してください");
       return false;
     }
+    syncRunTokenRef.current += 1;
+    commandGenerationRef.current += 1;
+    commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
+    applyOptimisticMotor(index, speed);
     try {
       addLog("tx", `PUT /api/motors/${index + 1} {"speed":${speed}}`);
-      const status = await requestApi(`/api/motors/${index + 1}`, {
+      await requestApi(`/api/motors/${index + 1}`, {
         method: "PUT",
+        headers: { "X-Command-Id": String(commandIdRef.current) },
         body: JSON.stringify({ speed }),
       });
-      applyStatus(status);
       return true;
     } catch (error) {
       addLog("error", error instanceof Error ? error.message : "送信に失敗しました");
@@ -335,12 +383,65 @@ export default function Home() {
     await setRemoteMotor(index, 0);
   }
 
+  async function runBothMotors() {
+    if (!connectedRef.current) {
+      addLog("error", "先にPicoへLAN接続してください");
+      return;
+    }
+
+    const token = ++syncRunTokenRef.current;
+    const generation = ++commandGenerationRef.current;
+    commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
+    const snapshot = motorsRef.current.map(
+      (motor) => motor.speed * motor.direction,
+    );
+    const next = motorsRef.current.map((motor, index) => ({
+      ...motor,
+      running: snapshot[index] !== 0,
+      direction: (snapshot[index] < 0 ? -1 : 1) as 1 | -1,
+      speed: Math.abs(snapshot[index]),
+    }));
+    motorsRef.current = next;
+    setMotors(next);
+    addLog(
+      "tx",
+      `PUT /api/motors/sync {"speed1":${snapshot[0]},"speed2":${snapshot[1]}}`,
+    );
+
+    try {
+      await requestApi("/api/motors/sync", {
+        method: "PUT",
+        headers: { "X-Command-Id": String(commandIdRef.current) },
+        body: JSON.stringify({ speed1: snapshot[0], speed2: snapshot[1] }),
+      });
+      if (
+        token === syncRunTokenRef.current &&
+        generation === commandGenerationRef.current
+      ) {
+        addLog("info", "同期命令1回で2台のモーターを開始しました");
+      }
+    } catch (error) {
+      addLog("error", error instanceof Error ? error.message : "同期命令に失敗しました");
+    }
+  }
+
   async function emergencyStop() {
     if (!connectedRef.current) return;
+    syncRunTokenRef.current += 1;
+    commandGenerationRef.current += 1;
+    commandIdRef.current = Math.max(commandIdRef.current + 1, Date.now());
+    const stopped = motorsRef.current.map((motor) => ({
+      ...motor,
+      running: false,
+    }));
+    motorsRef.current = stopped;
+    setMotors(stopped);
     try {
       addLog("tx", "POST /api/stop");
-      const status = await requestApi("/api/stop", { method: "POST" });
-      applyStatus(status);
+      await requestApi("/api/stop", {
+        method: "POST",
+        headers: { "X-Command-Id": String(commandIdRef.current) },
+      });
     } catch (error) {
       addLog("error", error instanceof Error ? error.message : "停止命令に失敗しました");
     }
@@ -436,9 +537,19 @@ export default function Home() {
               </p>
             )}
           </div>
-          <button className="emergency" onClick={emergencyStop} disabled={!connected}>
-            <span aria-hidden="true">■</span> すべて停止
-          </button>
+          <div className="deckActions">
+            <button
+              className="syncRun"
+              onClick={runBothMotors}
+              disabled={!connected}
+            >
+              <span aria-hidden="true">▶▶</span>
+              2台同時回転
+            </button>
+            <button className="emergency" onClick={emergencyStop} disabled={!connected}>
+              <span aria-hidden="true">■</span> 2台同時停止
+            </button>
+          </div>
         </div>
 
         <div className="motorGrid">
@@ -533,7 +644,7 @@ export default function Home() {
       </section>
 
       <footer>
-        <p><b>安全機能</b> ブラウザからの更新が1秒間途絶えると、Picoがモーターを自動停止します。</p>
+        <p><b>安全機能</b> 100ms周期の安全信号が0.5秒間途絶えると、Picoがモーターを自動停止します。</p>
         <p>W5500 <span>•</span> DHCP <span>•</span> mDNS</p>
       </footer>
     </main>

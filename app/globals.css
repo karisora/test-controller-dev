@@ -69,6 +69,10 @@ h1 em { color: transparent; -webkit-text-stroke: 1.5px var(--ink); font-style: n
 .sectionHeading, .consoleHeader { max-width: 1256px; margin: 0 auto 34px; display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }
 .sectionHeading h2, .consoleHeader h2 { font-size: clamp(26px, 3vw, 40px); margin: 8px 0 0; letter-spacing: -.04em; }
 .deviceMeta { margin: 9px 0 0; color: var(--muted); font: 500 10px var(--font-mono), monospace; }
+.deckActions { display: flex; align-items: stretch; gap: 10px; }
+.syncRun { border: 1px solid #91bd20; background: var(--green); color: var(--ink); padding: 12px 19px; font-size: 12px; font-weight: 800; }
+.syncRun:not(:disabled):hover, .emergency:not(:disabled):hover { transform: translateY(-2px); }
+.syncRun, .emergency { transition: transform .18s, background .18s; }
 .emergency { border: 1px solid #e2a895; background: #fff8f5; color: #b53920; padding: 12px 19px; font-size: 12px; font-weight: 700; }
 .motorGrid { max-width: 1256px; margin: auto; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 24px; }
 .motorCard { border: 1px solid var(--line); background: #fff; padding: clamp(24px, 3vw, 40px); position: relative; }
@@ -136,7 +140,8 @@ footer span { color: var(--green-dark); margin: 0 7px; }
   .connectPanel { padding: 25px; min-height: 300px; box-shadow: 9px 9px 0 var(--green); }
   .workspace { padding-top: 60px; }
   .sectionHeading { align-items: flex-start; flex-direction: column; }
-  .emergency { width: 100%; }
+  .deckActions { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+  .syncRun, .emergency { width: 100%; }
   .motorCard { padding: 24px 20px; }
   .motorCard::before { left: 20px; }
   .consoleBody { padding: 18px 15px; }

@@ -1,0 +1,13 @@
+.program stepper
+
+; Run this state machine at 1 MHz. The first two cycles form a stable
+; 2-microsecond STEP pulse; X controls the remaining low period.
+pull block
+mov x, osr
+.wrap_target
+set pins, 1 [1]
+set pins, 0
+mov y, x
+delay:
+jmp y-- delay
+.wrap

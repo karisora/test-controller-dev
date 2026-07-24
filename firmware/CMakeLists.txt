@@ -36,6 +36,10 @@ add_executable(pico_lan_stepper
   ${iolibrary_driver_SOURCE_DIR}/Internet/DHCP/dhcp.c
 )
 
+pico_generate_pio_header(pico_lan_stepper
+  ${CMAKE_CURRENT_LIST_DIR}/stepper.pio
+)
+
 target_include_directories(pico_lan_stepper PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}
   ${iolibrary_driver_SOURCE_DIR}/Ethernet
@@ -46,14 +50,16 @@ target_include_directories(pico_lan_stepper PRIVATE
 target_compile_definitions(pico_lan_stepper PRIVATE
   _WIZCHIP_=W5500
   MAX_SPEED_STEPS_PER_SEC=20000
-  MOTOR_API_WATCHDOG_MS=1000
+  MOTOR_API_WATCHDOG_MS=500
   MOTOR_HOSTNAME="pico-motor"
-  MOTOR_FIRMWARE_VERSION="2026.07.24.5"
+  MOTOR_FIRMWARE_VERSION="2026.07.24.14"
 )
 
 target_link_libraries(pico_lan_stepper
   pico_stdlib
   pico_unique_id
+  hardware_clocks
+  hardware_pio
   hardware_spi
 )
 

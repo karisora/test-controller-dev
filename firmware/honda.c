@@ -1,4 +1,7 @@
+#include "hardware/clocks.h"
+#include "hardware/pio.h"
 #include "pico/stdlib.h"
+#include "stepper.pio.h"
 #include "w5500_ethernet.h"
 
 #include <ctype.h>
@@ -20,54 +23,147 @@
 #ifndef MAX_SPEED_STEPS_PER_SEC
 #define MAX_SPEED_STEPS_PER_SEC 20000u
 #endif
-#define STEP_HIGH_US 2u
 #define DIR_SETUP_US 10u
 #define RX_LINE_SIZE 64u
+#define STEPPER_PIO_CLOCK_HZ 1000000u
+#define STEPPER_PIO_FIXED_CYCLES 5u
 
 #ifndef MOTOR_API_WATCHDOG_MS
-#define MOTOR_API_WATCHDOG_MS 1000u
+#define MOTOR_API_WATCHDOG_MS 500u
 #endif
 
 typedef struct {
     uint step_pin;
     uint dir_pin;
     uint led_pin;
+    PIO pio;
+    uint state_machine;
     int32_t signed_speed;
     uint32_t speed_steps_per_sec;
-    uint64_t step_interval_us;
-    uint64_t next_rise_us;
-    uint64_t fall_us;
     uint64_t stop_deadline_us;
-    bool step_is_high;
 } stepper_t;
 
 static stepper_t motors[] = {
-    {.step_pin = STEP1_PIN, .dir_pin = DIR1_PIN, .led_pin = LED1_PIN},
-    {.step_pin = STEP2_PIN, .dir_pin = DIR2_PIN, .led_pin = LED2_PIN},
+    {.step_pin = STEP1_PIN, .dir_pin = DIR1_PIN, .led_pin = LED1_PIN,
+     .pio = pio0, .state_machine = 0},
+    {.step_pin = STEP2_PIN, .dir_pin = DIR2_PIN, .led_pin = LED2_PIN,
+     .pio = pio0, .state_machine = 1},
 };
+static uint stepper_program_offset;
+
+static void stop_step_output(stepper_t *motor)
+{
+    pio_sm_set_enabled(motor->pio, motor->state_machine, false);
+    pio_sm_clear_fifos(motor->pio, motor->state_machine);
+    pio_sm_restart(motor->pio, motor->state_machine);
+    pio_sm_exec(motor->pio, motor->state_machine,
+                pio_encode_jmp(stepper_program_offset));
+    pio_sm_set_pins_with_mask(motor->pio, motor->state_machine, 0,
+                              1u << motor->step_pin);
+}
+
+static void start_step_output(stepper_t *motor, uint32_t steps_per_second)
+{
+    uint32_t period_cycles = STEPPER_PIO_CLOCK_HZ / steps_per_second;
+    uint32_t delay_cycles =
+        period_cycles > STEPPER_PIO_FIXED_CYCLES
+            ? period_cycles - STEPPER_PIO_FIXED_CYCLES
+            : 0;
+
+    stop_step_output(motor);
+    pio_sm_put_blocking(motor->pio, motor->state_machine, delay_cycles);
+    pio_sm_set_enabled(motor->pio, motor->state_machine, true);
+}
+
+static uint32_t normalize_speed(int32_t *signed_speed)
+{
+    int64_t speed64 = *signed_speed;
+    bool direction = speed64 >= 0;
+    uint64_t magnitude = direction ? (uint64_t)speed64 : (uint64_t)(-speed64);
+    if (magnitude > MAX_SPEED_STEPS_PER_SEC) {
+        magnitude = MAX_SPEED_STEPS_PER_SEC;
+        *signed_speed =
+            direction ? (int32_t)magnitude : -(int32_t)magnitude;
+    }
+    return (uint32_t)magnitude;
+}
+
+static void queue_step_output(stepper_t *motor, uint32_t steps_per_second)
+{
+    uint32_t period_cycles = STEPPER_PIO_CLOCK_HZ / steps_per_second;
+    uint32_t delay_cycles =
+        period_cycles > STEPPER_PIO_FIXED_CYCLES
+            ? period_cycles - STEPPER_PIO_FIXED_CYCLES
+            : 0;
+    pio_sm_put_blocking(motor->pio, motor->state_machine, delay_cycles);
+}
+
+static void set_motor_pair_speed(int32_t motor1_speed, int32_t motor2_speed,
+                                 uint32_t timeout_ms)
+{
+    int32_t requested[] = {motor1_speed, motor2_speed};
+    uint64_t now = time_us_64();
+    uint32_t enable_mask = 0;
+
+    for (size_t index = 0; index < count_of(motors); ++index) {
+        stepper_t *motor = &motors[index];
+        int32_t signed_speed = requested[index];
+        uint32_t magnitude = normalize_speed(&signed_speed);
+
+        if (magnitude == 0) {
+            if (motor->speed_steps_per_sec != 0) {
+                stop_step_output(motor);
+                gpio_put(motor->led_pin, 0);
+            }
+            motor->signed_speed = 0;
+            motor->speed_steps_per_sec = 0;
+            motor->stop_deadline_us = 0;
+            continue;
+        }
+
+        if (motor->speed_steps_per_sec != 0 &&
+            motor->signed_speed == signed_speed) {
+            motor->stop_deadline_us =
+                timeout_ms == 0
+                    ? 0
+                    : now + (uint64_t)timeout_ms * 1000u;
+            continue;
+        }
+
+        stop_step_output(motor);
+        gpio_put(motor->dir_pin, signed_speed >= 0);
+        gpio_put(motor->led_pin, 1);
+        motor->signed_speed = signed_speed;
+        motor->speed_steps_per_sec = magnitude;
+        motor->stop_deadline_us =
+            timeout_ms == 0 ? 0 : now + (uint64_t)timeout_ms * 1000u;
+        queue_step_output(motor, magnitude);
+        enable_mask |= 1u << motor->state_machine;
+    }
+
+    if (enable_mask != 0) {
+        sleep_us(DIR_SETUP_US);
+        // Both PIO state machines in the mask are enabled by one register
+        // write, so their first STEP edge starts on the same Pico clock.
+        pio_set_sm_mask_enabled(pio0, enable_mask, true);
+    }
+}
 
 static void set_motor_speed(stepper_t *motor, int32_t signed_speed,
                             uint32_t timeout_ms)
 {
-    int64_t speed64 = signed_speed;
-    bool direction = speed64 >= 0;
-    uint64_t magnitude = direction ? (uint64_t)speed64 : (uint64_t)(-speed64);
+    bool direction = signed_speed >= 0;
+    uint32_t magnitude = normalize_speed(&signed_speed);
 
     if (magnitude == 0) {
-        if (motor->speed_steps_per_sec != 0 || motor->step_is_high) {
-            gpio_put(motor->step_pin, 0);
+        if (motor->speed_steps_per_sec != 0) {
+            stop_step_output(motor);
             gpio_put(motor->led_pin, 0);
         }
-        motor->step_is_high = false;
         motor->signed_speed = 0;
         motor->speed_steps_per_sec = 0;
         motor->stop_deadline_us = 0;
         return;
-    }
-
-    if (magnitude > MAX_SPEED_STEPS_PER_SEC) {
-        magnitude = MAX_SPEED_STEPS_PER_SEC;
-        signed_speed = direction ? (int32_t)magnitude : -(int32_t)magnitude;
     }
 
     uint64_t now = time_us_64();
@@ -79,17 +175,15 @@ static void set_motor_speed(stepper_t *motor, int32_t signed_speed,
         return;
     }
 
-    gpio_put(motor->step_pin, 0);
-    motor->step_is_high = false;
-
+    stop_step_output(motor);
     gpio_put(motor->dir_pin, direction);
+    sleep_us(DIR_SETUP_US);
     gpio_put(motor->led_pin, 1);
     motor->signed_speed = signed_speed;
     motor->speed_steps_per_sec = (uint32_t)magnitude;
-    motor->step_interval_us = 1000000u / magnitude;
-    motor->next_rise_us = now + DIR_SETUP_US;
     motor->stop_deadline_us =
         timeout_ms == 0 ? 0 : now + (uint64_t)timeout_ms * 1000u;
+    start_step_output(motor, motor->speed_steps_per_sec);
 }
 
 static void service_motor(stepper_t *motor, uint64_t now_us)
@@ -100,20 +194,6 @@ static void service_motor(stepper_t *motor, uint64_t now_us)
         return;
     }
 
-    if (motor->step_is_high && now_us >= motor->fall_us) {
-        gpio_put(motor->step_pin, 0);
-        motor->step_is_high = false;
-    }
-
-    if (motor->speed_steps_per_sec == 0 || motor->step_is_high ||
-        now_us < motor->next_rise_us) {
-        return;
-    }
-
-    gpio_put(motor->step_pin, 1);
-    motor->step_is_high = true;
-    motor->fall_us = now_us + STEP_HIGH_US;
-    motor->next_rise_us = now_us + motor->step_interval_us;
 }
 
 static bool parse_command(char *line, uint32_t *id, int32_t *data)
@@ -183,11 +263,27 @@ static bool execute_motor_command(uint32_t id, int32_t data, uint32_t timeout_ms
 
 static bool execute_api_command(uint32_t id, int32_t data)
 {
+    stepper_t *motor = motor_for_id(id);
+    bool changed = motor != NULL && motor->signed_speed != data;
     bool accepted = execute_motor_command(id, data, MOTOR_API_WATCHDOG_MS);
-    if (accepted) {
+    if (accepted && changed) {
         printf("API OK 0x%lx,%ld\r\n", (unsigned long)id, (long)data);
     }
     return accepted;
+}
+
+static bool execute_api_pair_command(int32_t motor1_speed,
+                                     int32_t motor2_speed)
+{
+    bool changed =
+        motors[0].signed_speed != motor1_speed ||
+        motors[1].signed_speed != motor2_speed;
+    set_motor_pair_speed(motor1_speed, motor2_speed, MOTOR_API_WATCHDOG_MS);
+    if (changed) {
+        printf("API SYNC OK %ld,%ld\r\n",
+               (long)motor1_speed, (long)motor2_speed);
+    }
+    return true;
 }
 
 static int32_t read_api_motor_speed(uint32_t id)
@@ -237,10 +333,22 @@ int main(void)
 {
     stdio_init_all();
 
+    stepper_program_offset = pio_add_program(pio0, &stepper_program);
     for (size_t i = 0; i < count_of(motors); ++i) {
-        gpio_init(motors[i].step_pin);
-        gpio_set_dir(motors[i].step_pin, GPIO_OUT);
-        gpio_put(motors[i].step_pin, 0);
+        pio_sm_claim(motors[i].pio, motors[i].state_machine);
+        pio_gpio_init(motors[i].pio, motors[i].step_pin);
+        pio_sm_set_consecutive_pindirs(
+            motors[i].pio, motors[i].state_machine,
+            motors[i].step_pin, 1, true);
+        pio_sm_config config =
+            stepper_program_get_default_config(stepper_program_offset);
+        sm_config_set_set_pins(&config, motors[i].step_pin, 1);
+        sm_config_set_clkdiv(
+            &config,
+            (float)clock_get_hz(clk_sys) / (float)STEPPER_PIO_CLOCK_HZ);
+        pio_sm_init(motors[i].pio, motors[i].state_machine,
+                    stepper_program_offset, &config);
+        stop_step_output(&motors[i]);
 
         gpio_init(motors[i].dir_pin);
         gpio_set_dir(motors[i].dir_pin, GPIO_OUT);
@@ -252,7 +360,8 @@ int main(void)
     }
 
     bool ethernet_ready =
-        w5500_ethernet_init(execute_api_command, read_api_motor_speed);
+        w5500_ethernet_init(execute_api_command, execute_api_pair_command,
+                            read_api_motor_speed);
     if (ethernet_ready) {
         printf("Open motor control page: http://%s/ "
                "(http://" MOTOR_HOSTNAME ".local/)\r\n",

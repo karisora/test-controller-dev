@@ -61,7 +61,7 @@
 #define MOTOR_API_KEY ""
 #endif
 #ifndef MOTOR_API_WATCHDOG_MS
-#define MOTOR_API_WATCHDOG_MS 1000u
+#define MOTOR_API_WATCHDOG_MS 500u
 #endif
 #ifndef MOTOR_FIRMWARE_VERSION
 #define MOTOR_FIRMWARE_VERSION "dev"
@@ -73,7 +73,11 @@
 #define HTTP_SOCKET_FIRST 0u
 #define HTTP_SOCKET_COUNT 4u
 #define DHCP_SOCKET 4u
+#define URGENT_SOCKET 6u
 #define HTTP_PORT 80
+#define URGENT_PORT 5000u
+#define URGENT_PACKET_HEADER_SIZE 25u
+#define URGENT_PACKET_MAX_SIZE 96u
 #define DHCP_BUFFER_SIZE 1024u
 #define DHCP_STARTUP_TIMEOUT_US 15000000u
 #define REQUEST_BUFFER_SIZE 2048u
@@ -86,6 +90,7 @@
 #define MOTOR2_ID 0x101u
 
 static w5500_motor_command_callback_t command_motor;
+static w5500_motor_pair_command_callback_t command_motors;
 static w5500_motor_status_callback_t read_motor_speed;
 
 typedef struct {
@@ -117,8 +122,62 @@ static struct repeating_timer dhcp_timer;
 static bool phy_link_up;
 static bool phy_link_initialized;
 static uint64_t next_phy_link_check_us;
+static uint64_t latest_command_id;
+static uint16_t active_udp_command_session;
+static uint64_t latest_udp_command_id;
+static uint8_t seen_udp_command_sessions[UINT16_MAX / 8u + 1u];
+static uint32_t urgent_commands_accepted;
+static uint32_t safety_keepalives_received;
 
 static bool service_phy_link(void);
+
+static uint32_t read_big_endian_u32(const uint8_t *source)
+{
+    return (uint32_t)source[0] << 24 |
+           (uint32_t)source[1] << 16 |
+           (uint32_t)source[2] << 8 |
+           source[3];
+}
+
+static uint64_t read_big_endian_u64(const uint8_t *source)
+{
+    return (uint64_t)read_big_endian_u32(source) << 32 |
+           read_big_endian_u32(source + 4);
+}
+
+static bool accept_command_id(uint64_t command_id)
+{
+    if (command_id == 0 || command_id <= latest_command_id) {
+        return false;
+    }
+    latest_command_id = command_id;
+    return true;
+}
+
+static bool accept_udp_command(uint16_t session_id, uint64_t command_id)
+{
+    if (session_id == 0 || command_id == 0) {
+        return false;
+    }
+
+    uint16_t byte_index = session_id / 8u;
+    uint8_t bit = (uint8_t)(1u << (session_id % 8u));
+    bool session_seen =
+        (seen_udp_command_sessions[byte_index] & bit) != 0;
+    if (!session_seen) {
+        seen_udp_command_sessions[byte_index] |= bit;
+        active_udp_command_session = session_id;
+        latest_udp_command_id = command_id;
+        return true;
+    }
+    if (session_id != active_udp_command_session ||
+        command_id <= latest_udp_command_id) {
+        return false;
+    }
+
+    latest_udp_command_id = command_id;
+    return true;
+}
 
 static void chip_select(void)
 {
@@ -356,6 +415,42 @@ static bool authorized(const char *request)
            memcmp(value, expected, sizeof(expected) - 1) == 0;
 }
 
+typedef enum {
+    COMMAND_ORDER_ACCEPT,
+    COMMAND_ORDER_STALE,
+    COMMAND_ORDER_INVALID,
+} command_order_t;
+
+static command_order_t check_command_order(const char *request)
+{
+    const char *value = find_header(request, "X-Command-Id");
+    if (value == NULL) {
+        // Direct API clients that do not opt in retain the original behavior.
+        return COMMAND_ORDER_ACCEPT;
+    }
+
+    size_t length = header_value_length(value);
+    if (length == 0 || length >= 24) {
+        return COMMAND_ORDER_INVALID;
+    }
+
+    char encoded[24];
+    memcpy(encoded, value, length);
+    encoded[length] = '\0';
+    char *end;
+    errno = 0;
+    unsigned long long parsed = strtoull(encoded, &end, 10);
+    if (end != encoded + length || errno == ERANGE || parsed == 0) {
+        return COMMAND_ORDER_INVALID;
+    }
+
+    uint64_t command_id = (uint64_t)parsed;
+    if (!accept_command_id(command_id)) {
+        return COMMAND_ORDER_STALE;
+    }
+    return COMMAND_ORDER_ACCEPT;
+}
+
 static size_t request_content_length(const char *request)
 {
     const char *value = find_header(request, "Content-Length");
@@ -371,13 +466,14 @@ static size_t request_content_length(const char *request)
     return (size_t)length;
 }
 
-static bool parse_speed_json(const char *body, int32_t *speed)
+static bool parse_named_speed_json(const char *body, const char *name,
+                                   int32_t *speed)
 {
-    const char *key = strstr(body, "\"speed\"");
+    const char *key = strstr(body, name);
     if (key == NULL) {
         return false;
     }
-    const char *colon = strchr(key + 7, ':');
+    const char *colon = strchr(key + strlen(name), ':');
     if (colon == NULL) {
         return false;
     }
@@ -402,6 +498,18 @@ static bool parse_speed_json(const char *body, int32_t *speed)
     }
     *speed = (int32_t)parsed;
     return true;
+}
+
+static bool parse_speed_json(const char *body, int32_t *speed)
+{
+    return parse_named_speed_json(body, "\"speed\"", speed);
+}
+
+static bool parse_pair_speed_json(const char *body, int32_t *motor1_speed,
+                                  int32_t *motor2_speed)
+{
+    return parse_named_speed_json(body, "\"speed1\"", motor1_speed) &&
+           parse_named_speed_json(body, "\"speed2\"", motor2_speed);
 }
 
 static bool queue_http_response(const uint8_t *first, size_t first_length,
@@ -439,7 +547,8 @@ static void send_json(int status, const char *status_text, const char *json)
         "Cache-Control: no-store\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, X-API-Key, Accept\r\n"
+        "Access-Control-Allow-Headers: Content-Type, X-API-Key, "
+        "X-Command-Id, Accept\r\n"
         "Access-Control-Allow-Private-Network: true\r\n"
         "Access-Control-Max-Age: 600\r\n"
         "Connection: close\r\n\r\n%s",
@@ -463,11 +572,11 @@ static void send_control_page(void)
         "pre{white-space:pre-wrap;background:#eee;padding:12px}</style></head>"
         "<body><h1>W5500 Motor API</h1>"
         "<div class=\"motor\">Motor 1 <input id=\"s1\" type=\"number\" "
-        "min=\"-20000\" max=\"20000\" value=\"800\">"
+        "min=\"-20000\" max=\"20000\" value=\"500\">"
         "<button onclick=\"run(1)\">送信</button>"
         "<button onclick=\"halt(1)\">停止</button></div>"
         "<div class=\"motor\">Motor 2 <input id=\"s2\" type=\"number\" "
-        "min=\"-20000\" max=\"20000\" value=\"800\">"
+        "min=\"-20000\" max=\"20000\" value=\"500\">"
         "<button onclick=\"run(2)\">送信</button>"
         "<button onclick=\"halt(2)\">停止</button></div>"
         "<button onclick=\"stopAll()\">すべて停止</button>"
@@ -483,7 +592,7 @@ static void send_control_page(void)
         "function setMotor(n,v){return call('/api/motors/'+n,{method:'PUT',"
         "headers:{'Content-Type':'application/json'},body:JSON.stringify({speed:v})})}"
         "function run(n){let send=()=>setMotor(n,Number(document.getElementById('s'+n).value));"
-        "clearInterval(timers[n]);send();timers[n]=setInterval(send,500)}"
+        "clearInterval(timers[n]);send();timers[n]=setInterval(send,100)}"
         "function halt(n){clearInterval(timers[n]);setMotor(n,0)}"
         "function stopAll(){clearInterval(timers[1]);clearInterval(timers[2]);"
         "call('/api/stop',{method:'POST'})}"
@@ -510,7 +619,7 @@ static void send_status(void)
 {
     int32_t motor1 = read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR1_ID);
     int32_t motor2 = read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR2_ID);
-    char body[400];
+    char body[440];
     snprintf(
         body, sizeof(body),
         "{\"ok\":true,\"ip\":\"%s\","
@@ -520,12 +629,17 @@ static void send_status(void)
         "\"motors\":["
         "{\"id\":\"0x100\",\"speed\":%ld,\"running\":%s},"
         "{\"id\":\"0x101\",\"speed\":%ld,\"running\":%s}],"
-        "\"maxSpeed\":%d,\"watchdogMs\":%u,\"apiKeyRequired\":%s}",
+        "\"maxSpeed\":%d,\"watchdogMs\":%u,\"apiKeyRequired\":%s,"
+        "\"urgentCommands\":%lu,\"safetyKeepalives\":%lu,"
+        "\"udpCommandSession\":%u}",
         current_ip_address, dhcp_enabled ? "dhcp" : "link-local",
         (long)motor1, motor1 == 0 ? "false" : "true",
         (long)motor2, motor2 == 0 ? "false" : "true",
         MAX_SPEED_STEPS_PER_SEC, MOTOR_API_WATCHDOG_MS,
-        sizeof(MOTOR_API_KEY) > 1 ? "true" : "false");
+        sizeof(MOTOR_API_KEY) > 1 ? "true" : "false",
+        (unsigned long)urgent_commands_accepted,
+        (unsigned long)safety_keepalives_received,
+        active_udp_command_session);
     send_json(200, "OK", body);
 }
 
@@ -565,10 +679,32 @@ static void handle_request(char *request)
         send_status();
         return;
     }
+    if (strcmp(method, "POST") == 0 &&
+        strcmp(path, "/api/heartbeat") == 0) {
+        int32_t motor1 =
+            read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR1_ID);
+        int32_t motor2 =
+            read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR2_ID);
+        if (command_motors != NULL && command_motors(motor1, motor2)) {
+            send_status();
+        } else {
+            send_json(500, "Internal Server Error",
+                      "{\"ok\":false,\"error\":\"heartbeat failed\"}");
+        }
+        return;
+    }
     if (strcmp(method, "POST") == 0 && strcmp(path, "/api/stop") == 0) {
-        bool first = command_motor != NULL && command_motor(MOTOR1_ID, 0);
-        bool second = command_motor != NULL && command_motor(MOTOR2_ID, 0);
-        if (first && second) {
+        command_order_t order = check_command_order(request);
+        if (order == COMMAND_ORDER_INVALID) {
+            send_json(400, "Bad Request",
+                      "{\"ok\":false,\"error\":\"invalid command id\"}");
+            return;
+        }
+        if (order == COMMAND_ORDER_STALE) {
+            send_status();
+            return;
+        }
+        if (command_motors != NULL && command_motors(0, 0)) {
             send_status();
         } else {
             send_json(500, "Internal Server Error",
@@ -579,6 +715,37 @@ static void handle_request(char *request)
 
     bool motor_method =
         strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0;
+    if (motor_method && strcmp(path, "/api/motors/sync") == 0) {
+        char *body = strstr(request, "\r\n\r\n");
+        int32_t motor1_speed;
+        int32_t motor2_speed;
+        if (body == NULL ||
+            !parse_pair_speed_json(body + 4, &motor1_speed, &motor2_speed)) {
+            send_json(400, "Bad Request",
+                      "{\"ok\":false,\"error\":\"speed1 and speed2 must be "
+                      "integers between -20000 and 20000\"}");
+            return;
+        }
+        command_order_t order = check_command_order(request);
+        if (order == COMMAND_ORDER_INVALID) {
+            send_json(400, "Bad Request",
+                      "{\"ok\":false,\"error\":\"invalid command id\"}");
+            return;
+        }
+        if (order == COMMAND_ORDER_STALE) {
+            send_status();
+            return;
+        }
+        if (command_motors == NULL ||
+            !command_motors(motor1_speed, motor2_speed)) {
+            send_json(500, "Internal Server Error",
+                      "{\"ok\":false,\"error\":\"motor callback failed\"}");
+            return;
+        }
+        send_status();
+        return;
+    }
+
     uint32_t id = 0;
     if (strcmp(path, "/api/motors/1") == 0) {
         id = MOTOR1_ID;
@@ -592,6 +759,16 @@ static void handle_request(char *request)
             send_json(400, "Bad Request",
                       "{\"ok\":false,\"error\":\"speed must be an integer "
                       "between -20000 and 20000\"}");
+            return;
+        }
+        command_order_t order = check_command_order(request);
+        if (order == COMMAND_ORDER_INVALID) {
+            send_json(400, "Bad Request",
+                      "{\"ok\":false,\"error\":\"invalid command id\"}");
+            return;
+        }
+        if (order == COMMAND_ORDER_STALE) {
+            send_status();
             return;
         }
         if (command_motor == NULL || !command_motor(id, speed)) {
@@ -706,9 +883,8 @@ static bool service_phy_link(void)
     phy_link_up = link_is_up;
     if (!phy_link_up) {
         // PHYリンク断を検出した時点で、API制御中かどうかに関係なく停止する。
-        if (command_motor != NULL) {
-            command_motor(MOTOR1_ID, 0);
-            command_motor(MOTOR2_ID, 0);
+        if (command_motors != NULL) {
+            command_motors(0, 0);
         }
         reset_all_http_sockets();
         stop_dhcp_client();
@@ -752,10 +928,102 @@ static void service_dhcp(void)
     }
 }
 
+static void service_urgent_commands(void)
+{
+    if (getSn_SR(URGENT_SOCKET) != SOCK_UDP) {
+        close(URGENT_SOCKET);
+        socket(URGENT_SOCKET, Sn_MR_UDP, URGENT_PORT, 0);
+        return;
+    }
+
+    uint16_t available = getSn_RX_RSR(URGENT_SOCKET);
+    if (available == 0) {
+        return;
+    }
+
+    uint8_t packet[URGENT_PACKET_MAX_SIZE];
+    uint8_t source_ip[4];
+    uint16_t source_port;
+    uint16_t receive_length =
+        available < sizeof(packet) ? available : (uint16_t)sizeof(packet);
+    int32_t received = recvfrom(URGENT_SOCKET, packet, receive_length,
+                                source_ip, &source_port);
+    (void)source_ip;
+    (void)source_port;
+    if (received < (int32_t)URGENT_PACKET_HEADER_SIZE ||
+        memcmp(packet, "PMOT", 4) != 0 || packet[4] != 1) {
+        return;
+    }
+
+    uint8_t type = packet[5];
+    uint16_t command_session =
+        (uint16_t)packet[6] << 8 | packet[7];
+    uint64_t command_id = read_big_endian_u64(packet + 8);
+    uint32_t motor_id = read_big_endian_u32(packet + 16);
+    int32_t motor1_speed = (int32_t)motor_id;
+    int32_t speed = (int32_t)read_big_endian_u32(packet + 20);
+    uint8_t key_length = packet[24];
+    if ((size_t)received != URGENT_PACKET_HEADER_SIZE + key_length ||
+        key_length != sizeof(MOTOR_API_KEY) - 1 ||
+        memcmp(packet + URGENT_PACKET_HEADER_SIZE, MOTOR_API_KEY,
+               key_length) != 0) {
+        return;
+    }
+
+    bool valid_stop = type == 0 && motor_id == 0 && speed == 0;
+    bool valid_motor =
+        type == 1 && (motor_id == MOTOR1_ID || motor_id == MOTOR2_ID) &&
+        speed >= -MAX_SPEED_STEPS_PER_SEC &&
+        speed <= MAX_SPEED_STEPS_PER_SEC;
+    bool valid_heartbeat =
+        type == 2 && command_id == 0 && motor_id == 0 && speed == 0;
+    bool valid_pair =
+        type == 3 &&
+        motor1_speed >= -MAX_SPEED_STEPS_PER_SEC &&
+        motor1_speed <= MAX_SPEED_STEPS_PER_SEC &&
+        speed >= -MAX_SPEED_STEPS_PER_SEC &&
+        speed <= MAX_SPEED_STEPS_PER_SEC;
+    if (!valid_stop && !valid_motor && !valid_heartbeat && !valid_pair) {
+        return;
+    }
+
+    if (valid_heartbeat) {
+        int32_t motor1 =
+            read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR1_ID);
+        int32_t motor2 =
+            read_motor_speed == NULL ? 0 : read_motor_speed(MOTOR2_ID);
+        if (command_motors != NULL && command_motors(motor1, motor2)) {
+            ++safety_keepalives_received;
+        }
+        return;
+    }
+
+    if (!accept_udp_command(command_session, command_id)) {
+        return;
+    }
+
+    ++urgent_commands_accepted;
+    if (valid_stop) {
+        if (command_motors != NULL) {
+            command_motors(0, 0);
+        }
+    } else if (valid_pair) {
+        if (command_motors != NULL) {
+            command_motors(motor1_speed, speed);
+        }
+    } else {
+        if (command_motor != NULL) {
+            command_motor(motor_id, speed);
+        }
+    }
+}
+
 bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
+                         w5500_motor_pair_command_callback_t pair_callback,
                          w5500_motor_status_callback_t status_callback)
 {
     command_motor = command_callback;
+    command_motors = pair_callback;
     read_motor_speed = status_callback;
     active_http_connection = NULL;
     for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
@@ -851,6 +1119,12 @@ static void service_http_socket(uint8_t socket_number,
                 }
                 if (interrupts & Sn_IR_SENDOK) {
                     setSn_IR(socket_number, Sn_IR_SENDOK);
+                    // "Connection: close" requires a graceful FIN after the
+                    // response payload has left the W5500. A delayed hard
+                    // CLOSE caused client-side resets and exhausted the four
+                    // HTTP listener sockets during repeated heartbeats.
+                    begin_passive_http_disconnect(socket_number, connection);
+                    break;
                 }
                 if (now - connection->response_sent_us >=
                     RESPONSE_CLOSE_TIMEOUT_US) {
@@ -948,6 +1222,7 @@ void w5500_ethernet_service(void)
     }
 
     service_dhcp();
+    service_urgent_commands();
 
     for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
         service_http_socket(HTTP_SOCKET_FIRST + index,

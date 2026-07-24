@@ -1,0 +1,59 @@
+cmake_minimum_required(VERSION 3.13)
+
+include(pico_sdk_import.cmake)
+
+project(pico_lan_stepper C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+pico_sdk_init()
+
+include(FetchContent)
+FetchContent_Declare(
+  iolibrary_driver
+  GIT_REPOSITORY https://github.com/Wiznet/ioLibrary_Driver.git
+  GIT_TAG v3.2.0
+  GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(iolibrary_driver)
+if(NOT iolibrary_driver_POPULATED)
+  FetchContent_Populate(iolibrary_driver)
+endif()
+
+add_executable(pico_lan_stepper
+  main.c
+  w5500_ethernet.c
+  ${iolibrary_driver_SOURCE_DIR}/Ethernet/socket.c
+  ${iolibrary_driver_SOURCE_DIR}/Ethernet/wizchip_conf.c
+  ${iolibrary_driver_SOURCE_DIR}/Ethernet/W5500/w5500.c
+)
+
+target_include_directories(pico_lan_stepper PRIVATE
+  ${CMAKE_CURRENT_LIST_DIR}
+  ${iolibrary_driver_SOURCE_DIR}/Ethernet
+  ${iolibrary_driver_SOURCE_DIR}/Ethernet/W5500
+)
+
+target_compile_definitions(pico_lan_stepper PRIVATE
+  _WIZCHIP_=W5500
+  MAX_SPEED_STEPS_PER_SEC=20000
+  MOTOR_API_WATCHDOG_MS=10000
+  MOTOR_IP_ADDRESS="192.168.1.50"
+  MOTOR_IP_OCTET_1=192
+  MOTOR_IP_OCTET_2=168
+  MOTOR_IP_OCTET_3=1
+  MOTOR_IP_OCTET_4=50
+  MOTOR_GATEWAY_OCTET_1=192
+  MOTOR_GATEWAY_OCTET_2=168
+  MOTOR_GATEWAY_OCTET_3=1
+  MOTOR_GATEWAY_OCTET_4=1
+)
+
+target_link_libraries(pico_lan_stepper
+  pico_stdlib
+  hardware_spi
+)
+
+pico_enable_stdio_usb(pico_lan_stepper 1)
+pico_enable_stdio_uart(pico_lan_stepper 0)
+pico_add_extra_outputs(pico_lan_stepper)

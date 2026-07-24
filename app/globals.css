@@ -52,12 +52,23 @@ h1 em { color: transparent; -webkit-text-stroke: 1.5px var(--ink); font-style: n
 .button.primary { background: var(--green); color: var(--ink); }
 .button.secondary { background: transparent; color: white; border: 1px solid #53605d; }
 .connectPanel small { color: #8a9692; text-align: center; margin-top: 14px; font: 400 9px var(--font-mono), monospace; }
+.lanPanel { justify-content: flex-start; gap: 13px; }
+.lanPanel::before { content: "01 / LAN CONNECT"; }
+.lanGraphic { display: flex; align-items: center; justify-content: center; margin: 16px 0 8px; }
+.ethernetJack { width: 58px; height: 45px; border: 2px solid var(--green); color: var(--green); display: grid; place-items: center; font: 600 10px var(--font-mono), monospace; position: relative; }
+.ethernetJack::before { content: ""; position: absolute; width: 28px; height: 7px; bottom: -2px; border: 2px solid var(--green); border-bottom: 0; }
+.connectField { display: grid; gap: 7px; }
+.connectField span { color: #8d9794; font: 500 9px var(--font-mono), monospace; letter-spacing: .12em; }
+.connectField input { width: 100%; min-height: 43px; border: 1px solid #53605d; color: white; background: #162523; outline: none; padding: 0 13px; font: 500 13px var(--font-mono), monospace; }
+.connectField input:focus { border-color: var(--green); }
+.connectField input:disabled { color: #9aa5a2; }
 .browserWarning { display: grid; gap: 7px; padding: 18px; border: 1px solid var(--orange); color: #fff; }
 .browserWarning span { color: #adb6b3; font-size: 12px; line-height: 1.7; }
 
 .workspace { background: var(--surface); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 82px clamp(20px, 6vw, 92px) 96px; }
 .sectionHeading, .consoleHeader { max-width: 1256px; margin: 0 auto 34px; display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }
 .sectionHeading h2, .consoleHeader h2 { font-size: clamp(26px, 3vw, 40px); margin: 8px 0 0; letter-spacing: -.04em; }
+.deviceMeta { margin: 9px 0 0; color: var(--muted); font: 500 10px var(--font-mono), monospace; }
 .emergency { border: 1px solid #e2a895; background: #fff8f5; color: #b53920; padding: 12px 19px; font-size: 12px; font-weight: 700; }
 .motorGrid { max-width: 1256px; margin: auto; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 24px; }
 .motorCard { border: 1px solid var(--line); background: #fff; padding: clamp(24px, 3vw, 40px); position: relative; }

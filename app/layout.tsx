@@ -6,8 +6,8 @@ const sans = Noto_Sans_JP({ subsets: ["latin"], variable: "--font-noto-sans-jp" 
 const mono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
 
 export const metadata: Metadata = {
-  title: "Pico Stepper Console | USBモーターテスト",
-  description: "Raspberry Pi PicoへWeb Serialで接続し、2台のステップモーターをブラウザから安全にテストします。",
+  title: "Pico Stepper LAN Console | W5500モーター制御",
+  description: "W5500を接続したRaspberry Pi PicoへLANのHTTP APIで接続し、2台のステップモーターを制御します。",
 };
 
 export const viewport: Viewport = {

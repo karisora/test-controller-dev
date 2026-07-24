@@ -1,55 +1,120 @@
-# Pico Stepper Console
+# Pico Stepper LAN Console
 
-Raspberry Pi PicoへブラウザのWeb Serial APIで接続し、2台のステップモーターを動作確認するVercel向けNext.jsアプリです。
+W5500を接続したRaspberry Pi PicoへLAN内のHTTP APIで命令を送り、2台のSTEP/DIR式ステップモーターを制御するプロジェクトです。
 
-## 動作条件
+- `firmware/`: Pico SDK用ファームウェア（W5500 HTTP API）
+- `app/`: APIを操作するNext.jsブラウザ画面
 
-- PC版 Google Chrome または Microsoft Edge（Web Serial対応ブラウザ）
-- Raspberry Pi Picoとデータ通信対応USBケーブル
-- Pico SDK側でUSB CDC標準入出力を有効にしたファームウェア
-- VercelのHTTPS環境、またはローカルの `localhost`
+## 配線
 
-Safari、Firefox、iOS版ChromeではWeb Serialを利用できません。ブラウザのポート選択画面は、セキュリティ上ユーザーが「USBポートを選択」を押したときだけ表示されます。
+### モータードライバー
+
+| 用途 | Pico GPIO |
+| --- | ---: |
+| Motor 1 STEP | 4 |
+| Motor 1 DIR | 5 |
+| Motor 2 STEP | 6 |
+| Motor 2 DIR | 7 |
+| Motor 1 LED | 14 |
+| Motor 2 LED | 15 |
+
+### W5500（SPI0）
+
+| W5500 | Pico GPIO |
+| --- | ---: |
+| MISO | 16 |
+| CS / SCS | 17 |
+| SCK | 18 |
+| MOSI | 19 |
+| RESET / RSTn | 20 |
+| 3.3V | 3V3 |
+| GND | GND |
+
+PicoとW5500は3.3Vロジックです。モーターはPicoから直接駆動せず、必ずSTEP/DIR入力対応ドライバーと別電源を使用し、GNDを共通にしてください。
 
 ## Picoファームウェア
 
-質問文のCコードをPicoへ書き込みます。`CMakeLists.txt` ではUSB標準入出力を有効にしてください。
+### 1. ネットワーク設定
+
+初期値は以下です。
+
+- Pico: `192.168.1.50`
+- Gateway/DNS: `192.168.1.1`
+- Subnet: `255.255.255.0`
+- HTTP port: `80`
+
+LAN環境が `192.168.0.x` などの場合は、[firmware/CMakeLists.txt](firmware/CMakeLists.txt) の `MOTOR_IP_*` と `MOTOR_GATEWAY_*` を変更してください。`MOTOR_IP_ADDRESS` の表示用文字列も同じIPに合わせます。
+
+同じLAN内で重複しない固定IPを選び、可能ならルーター側のDHCP配布範囲外にしてください。
+
+### 2. ビルド
+
+Pico SDK、CMake、Arm GNU Toolchainを用意し、`PICO_SDK_PATH` を設定します。WIZnet公式 `ioLibrary_Driver` v3.2.0はCMake初回実行時に取得されます。
+
+```bash
+cd firmware
+cmake -S . -B build
+cmake --build build -j
+```
+
+生成された `firmware/build/pico_lan_stepper.uf2` を、BOOTSELモードのPicoへコピーします。
+
+APIキーを付ける場合は `target_compile_definitions` に次を追加し、Web画面にも同じ値を入力します。
 
 ```cmake
-pico_enable_stdio_usb(your_target 1)
-pico_enable_stdio_uart(your_target 0)
+MOTOR_API_KEY="change-this-key"
 ```
 
-Webアプリは115200 baudで接続し、次のASCIIコマンドを改行付きで送信します。
+## HTTP API
 
-```text
-0x100,800
-0x101,-1200
-0x100,0
+### 状態取得
+
+```bash
+curl http://192.168.1.50/api/status
 ```
 
-`0x100` はモーター1、`0x101` はモーター2です。正数は正転、負数は逆転、0は停止です。
+### Motor 1を正転800 steps/s
 
-## ローカル起動
+```bash
+curl -X PUT http://192.168.1.50/api/motors/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"speed":800}'
+```
+
+### Motor 2を逆転1200 steps/s
+
+```bash
+curl -X PUT http://192.168.1.50/api/motors/2 \
+  -H 'Content-Type: application/json' \
+  -d '{"speed":-1200}'
+```
+
+### 全停止
+
+```bash
+curl -X POST http://192.168.1.50/api/stop
+```
+
+APIキーを設定した場合は、すべてのリクエストへ `-H 'X-API-Key: change-this-key'` を追加します。
+
+速度は `-20000`〜`20000` の整数です。正数は正転、負数は逆転、`0`は停止です。モーター1はID `0x100`、モーター2はID `0x101`です。
+
+## ブラウザ画面
 
 ```bash
 npm install
 npm run dev
 ```
 
-ChromeまたはEdgeで `http://localhost:3000` を開きます。
+PCとPicoを同じLANへ接続し、ブラウザで `http://localhost:3000` を開きます。PicoのIPを入力して「Picoへ接続」を押してください。
 
-## Vercelへデプロイ
+W5500側はHTTPのみのため、VercelなどHTTPSで公開した画面から直接アクセスするとブラウザのMixed Content制限で遮断されます。この操作画面はLAN内のPCで `localhost` として起動してください。
 
-1. このフォルダーをGitHubリポジトリへpushします。
-2. Vercelで「Add New Project」からリポジトリを選びます。
-3. Framework Presetが `Next.js`、Build Commandが `next build` であることを確認します。
-4. Deployを実行します。環境変数は不要です。
+## 安全機能
 
-USB通信はVercelのサーバーを経由しません。ブラウザとPicoの間だけで処理されます。
-
-## 安全上の注意
-
-- 最初は低速で、モーターを機構から外すか、すぐ電源を切れる状態で確認してください。
-- ブラウザやUSBが切断されても、Picoは最後に受信した速度で動作を続ける可能性があります。実機運用ではファームウェア側に通信タイムアウトによる自動停止を追加してください。
-- `MAX_SPEED_STEPS_PER_SEC` はドライバー、モーター、電源、機構に合わせて調整してください。
+- LAN経由の運転命令には10秒のウォッチドッグがあります。画面は運転中に3秒ごとに命令を更新し、通信断ではPicoが自動停止します。
+- 「LANを切断」は先に全停止を要求します。停止確認に失敗してもウォッチドッグが働きます。
+- API入力は最大速度範囲を検証します。
+- USBシリアルの `0x100,800` 形式も保守用に残しています。USB命令にはウォッチドッグがありません。
+- 初回は機構からモーターを外すか、すぐ主電源を切れる状態で低速から確認してください。
+- 実機の非常停止はソフトウェアだけに依存せず、モータードライバー電源またはENABLEを遮断する物理スイッチを設けてください。

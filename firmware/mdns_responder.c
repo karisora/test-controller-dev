@@ -238,6 +238,10 @@ void mdns_responder_service(const uint8_t ip[4])
         unicast_requested ? source_ip : multicast_ip;
     uint16_t destination_port =
         unicast_requested ? source_port : MDNS_PORT;
-    sendto(MDNS_SOCKET, response, (uint16_t)offset,
-           destination_ip, destination_port);
+    if (sendto(MDNS_SOCKET, response, (uint16_t)offset,
+               destination_ip, destination_port) < 0) {
+        // Recreate the UDP socket after a cable pull or W5500 socket error so
+        // that the next reconnect attempt can resolve pico-motor.local again.
+        open_multicast_socket();
+    }
 }

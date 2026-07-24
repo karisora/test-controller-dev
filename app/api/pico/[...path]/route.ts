@@ -13,7 +13,16 @@ const MDNS_ADDRESS = "224.0.0.251";
 const MDNS_PORT = 5353;
 const DISCOVERY_TIMEOUT_MS = 1500;
 const DNS_TIMEOUT_MS = 1200;
-const UPSTREAM_TIMEOUT_MS = 5000;
+const UPSTREAM_TIMEOUT_MS = 2000;
+const ADDRESS_CACHE_MS = 30000;
+
+type AddressCacheEntry = {
+  address: string;
+  expiresAt: number;
+};
+
+const addressCache = new Map<string, AddressCacheEntry>();
+const addressResolution = new Map<string, Promise<string>>();
 
 function jsonError(message: string, status: number) {
   return Response.json({ ok: false, error: message }, { status });
@@ -133,7 +142,7 @@ async function discoverMdns(hostname: string) {
   });
 }
 
-async function resolvePrivateAddress(hostname: string) {
+async function resolvePrivateAddressUncached(hostname: string) {
   if (isIP(hostname) === 4) {
     if (!isPrivateIpv4(hostname)) {
       throw new Error("接続先はLAN内のIPv4アドレスに限定されています");
@@ -176,6 +185,38 @@ async function resolvePrivateAddress(hostname: string) {
   return resolvedAddress;
 }
 
+async function resolvePrivateAddress(hostname: string, forceRefresh = false) {
+  const key = hostname.toLowerCase();
+  if (isIP(hostname) === 4) {
+    return resolvePrivateAddressUncached(hostname);
+  }
+
+  if (forceRefresh) {
+    addressCache.delete(key);
+  } else {
+    const cached = addressCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.address;
+    }
+  }
+  const pending = addressResolution.get(key);
+  if (pending) return pending;
+
+  const resolution = resolvePrivateAddressUncached(hostname)
+    .then((address) => {
+      addressCache.set(key, {
+        address,
+        expiresAt: Date.now() + ADDRESS_CACHE_MS,
+      });
+      return address;
+    })
+    .finally(() => {
+      addressResolution.delete(key);
+    });
+  addressResolution.set(key, resolution);
+  return resolution;
+}
+
 function endpointAllowed(method: string, path: string) {
   if (method === "GET" && (path === "api/status" || path === "api/health")) {
     return true;
@@ -209,30 +250,48 @@ async function proxyRequest(request: Request, context: RouteContext) {
       return jsonError("Picoの接続先はHTTPポート80を指定してください", 400);
     }
 
-    const address = await resolvePrivateAddress(target.hostname);
     const headers = new Headers();
     const contentType = request.headers.get("content-type");
     const apiKey = request.headers.get("x-api-key");
     if (contentType) headers.set("Content-Type", contentType);
     if (apiKey) headers.set("X-API-Key", apiKey);
     headers.set("Host", target.hostname);
+    headers.set("Connection", "close");
 
-    const upstream = await fetch(`http://${address}/${path}`, {
-      method: request.method,
-      headers,
-      body:
-        request.method === "GET" || request.method === "HEAD"
-          ? undefined
-          : await request.text(),
-      cache: "no-store",
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-    return new Response(await upstream.text(), {
+    const body =
+      request.method === "GET" || request.method === "HEAD"
+        ? undefined
+        : await request.text();
+    const fetchUpstream = async (address: string) => {
+      const upstream = await fetch(`http://${address}/${path}`, {
+        method: request.method,
+        headers,
+        body,
+        cache: "no-store",
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      return {
+        status: upstream.status,
+        contentType: upstream.headers.get("content-type"),
+        text: await upstream.text(),
+      };
+    };
+
+    let address = await resolvePrivateAddress(target.hostname);
+    let upstream;
+    try {
+      upstream = await fetchUpstream(address);
+    } catch {
+      // The Pico may have rebooted or received a new DHCP address. Discard both
+      // the address cache and the failed TCP connection, then resolve and retry.
+      address = await resolvePrivateAddress(target.hostname, true);
+      upstream = await fetchUpstream(address);
+    }
+    return new Response(upstream.text, {
       status: upstream.status,
       headers: {
         "Content-Type":
-          upstream.headers.get("content-type") ??
-          "application/json; charset=utf-8",
+          upstream.contentType ?? "application/json; charset=utf-8",
         "Cache-Control": "no-store",
       },
     });

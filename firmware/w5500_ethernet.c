@@ -75,6 +75,7 @@
 #define REQUEST_BUFFER_SIZE 2048u
 #define RESPONSE_BUFFER_SIZE 2048u
 #define REQUEST_TIMEOUT_US 2000000u
+#define HTTP_CLOSE_TIMEOUT_US 250000u
 #define PHY_LINK_CHECK_INTERVAL_US 1000u
 #define MOTOR1_ID 0x100u
 #define MOTOR2_ID 0x101u
@@ -99,6 +100,8 @@ static struct repeating_timer dhcp_timer;
 static bool phy_link_up;
 static bool phy_link_initialized;
 static uint64_t next_phy_link_check_us;
+static uint8_t previous_http_socket_state = 0xffu;
+static uint64_t http_socket_state_started_us;
 
 static bool service_phy_link(void);
 
@@ -571,6 +574,27 @@ static void reset_request(void)
     request_buffer[0] = '\0';
 }
 
+static void reset_http_socket(void)
+{
+    close(HTTP_SOCKET);
+    reset_request();
+    previous_http_socket_state = 0xffu;
+    http_socket_state_started_us = time_us_64();
+}
+
+static void begin_http_disconnect(void)
+{
+    // ioLibrary's disconnect() waits synchronously until the peer completes
+    // the TCP close handshake. Issue only the W5500 command here so a vanished
+    // browser cannot block the entire firmware service loop.
+    setSn_CR(HTTP_SOCKET, Sn_CR_DISCON);
+    while (getSn_CR(HTTP_SOCKET) != 0) {
+    }
+    reset_request();
+    previous_http_socket_state = 0xffu;
+    http_socket_state_started_us = time_us_64();
+}
+
 static bool service_phy_link(void)
 {
     uint64_t now = time_us_64();
@@ -601,8 +625,7 @@ static bool service_phy_link(void)
             command_motor(MOTOR1_ID, 0);
             command_motor(MOTOR2_ID, 0);
         }
-        close(HTTP_SOCKET);
-        reset_request();
+        reset_http_socket();
         stop_dhcp_client();
         if (mdns_started) {
             mdns_responder_stop();
@@ -613,8 +636,7 @@ static bool service_phy_link(void)
     }
 
     printf("LAN link restored\r\n");
-    close(HTTP_SOCKET);
-    reset_request();
+    reset_http_socket();
     acquire_network_address();
     if (!mdns_started) {
         mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
@@ -637,8 +659,7 @@ static void service_dhcp(void)
 
     if (apply_dhcp_address()) {
         printf("DHCP address changed to %s\r\n", current_ip_address);
-        close(HTTP_SOCKET);
-        reset_request();
+        reset_http_socket();
         if (mdns_started) {
             mdns_responder_stop();
             mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
@@ -652,6 +673,8 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
     command_motor = command_callback;
     read_motor_speed = status_callback;
     reset_request();
+    previous_http_socket_state = 0xffu;
+    http_socket_state_started_us = 0;
     configure_unique_mac();
 
     gpio_init(W5500_CS_PIN);
@@ -710,14 +733,23 @@ void w5500_ethernet_service(void)
     service_dhcp();
 
     uint8_t state = getSn_SR(HTTP_SOCKET);
+    uint64_t now = time_us_64();
+    if (state != previous_http_socket_state) {
+        previous_http_socket_state = state;
+        http_socket_state_started_us = now;
+    }
 
     switch (state) {
         case SOCK_CLOSED:
             reset_request();
-            socket(HTTP_SOCKET, Sn_MR_TCP, HTTP_PORT, 0);
+            if (socket(HTTP_SOCKET, Sn_MR_TCP, HTTP_PORT, 0) != HTTP_SOCKET) {
+                reset_http_socket();
+            }
             break;
         case SOCK_INIT:
-            listen(HTTP_SOCKET);
+            if (listen(HTTP_SOCKET) != SOCK_OK) {
+                reset_http_socket();
+            }
             break;
         case SOCK_ESTABLISHED: {
             if (getSn_IR(HTTP_SOCKET) & Sn_IR_CON) {
@@ -735,8 +767,7 @@ void w5500_ethernet_service(void)
                 if (chunk == 0) {
                     send_json(413, "Payload Too Large",
                               "{\"ok\":false,\"error\":\"request too large\"}");
-                    disconnect(HTTP_SOCKET);
-                    reset_request();
+                    begin_http_disconnect();
                     break;
                 }
                 int32_t received =
@@ -754,24 +785,38 @@ void w5500_ethernet_service(void)
                 size_t content_length = request_content_length(request_buffer);
                 if (request_length >= header_length + content_length) {
                     handle_request(request_buffer);
-                    disconnect(HTTP_SOCKET);
-                    reset_request();
+                    begin_http_disconnect();
                 }
             }
             if (request_started_us != 0 &&
                 time_us_64() - request_started_us > REQUEST_TIMEOUT_US) {
                 send_json(408, "Request Timeout",
                           "{\"ok\":false,\"error\":\"request timeout\"}");
-                disconnect(HTTP_SOCKET);
-                reset_request();
+                begin_http_disconnect();
             }
             break;
         }
         case SOCK_CLOSE_WAIT:
-            disconnect(HTTP_SOCKET);
-            reset_request();
+            // The peer has already gone away. A hard close is safe here and
+            // immediately makes socket 0 available for the next browser.
+            reset_http_socket();
+            break;
+        case SOCK_FIN_WAIT:
+        case SOCK_CLOSING:
+        case SOCK_TIME_WAIT:
+        case SOCK_LAST_ACK:
+        case SOCK_SYNSENT:
+        case SOCK_SYNRECV:
+            // If the peer vanished during the TCP close handshake, W5500 can
+            // otherwise remain in a transitional state and never listen again.
+            if (now - http_socket_state_started_us >= HTTP_CLOSE_TIMEOUT_US) {
+                reset_http_socket();
+            }
             break;
         default:
+            // Socket 0 is reserved for HTTP/TCP. Recover from any corrupt or
+            // unexpected mode instead of leaving the API permanently offline.
+            reset_http_socket();
             break;
     }
 

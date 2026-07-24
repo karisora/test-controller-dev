@@ -38,6 +38,7 @@ const MAX_SPEED = 20000;
 const DEFAULT_DEVICE = "pico-motor.local";
 const HEARTBEAT_MS = 300;
 const API_TIMEOUT_MS = 8000;
+const RECONNECT_DELAY_MS = 2000;
 
 function nowLabel() {
   return new Intl.DateTimeFormat("ja-JP", {
@@ -64,6 +65,7 @@ export default function Home() {
   const [apiKey, setApiKey] = useState("");
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [reconnectEnabled, setReconnectEnabled] = useState(false);
   const [deviceInfo, setDeviceInfo] = useState<ApiStatus | null>(null);
   const [motors, setMotors] = useState<MotorState[]>([
     { id: "0x100", speed: 800, direction: 1, running: false },
@@ -78,6 +80,9 @@ export default function Home() {
   const activeBaseUrlRef = useRef("");
   const apiKeyRef = useRef(apiKey);
   const requestChainRef = useRef<Promise<void>>(Promise.resolve());
+  const connectingRef = useRef(false);
+  const statusPollInFlightRef = useRef(false);
+  const heartbeatInFlightRef = useRef(false);
 
   useEffect(() => {
     motorsRef.current = motors;
@@ -177,7 +182,10 @@ export default function Home() {
   );
 
   const disconnect = useCallback(async () => {
-    if (connectedRef.current && motorsRef.current.some((motor) => motor.running)) {
+    setReconnectEnabled(false);
+    const wasConnected = connectedRef.current;
+    connectedRef.current = false;
+    if (wasConnected && motorsRef.current.some((motor) => motor.running)) {
       try {
         await requestApi("/api/stop", { method: "POST" }, true);
         addLog("info", "切断前に全モーターを停止しました");
@@ -193,7 +201,9 @@ export default function Home() {
     addLog("info", "LAN接続を終了しました");
   }, [addLog, requestApi]);
 
-  async function connect() {
+  const attemptConnection = useCallback(async (automatic: boolean) => {
+    if (connectingRef.current || connectedRef.current) return;
+    connectingRef.current = true;
     setConnecting(true);
     try {
       const baseUrl = normalizeBaseUrl(deviceAddress);
@@ -204,19 +214,42 @@ export default function Home() {
       applyStatus(status);
       connectedRef.current = true;
       setConnected(true);
-      addLog("info", `PicoにLAN接続しました（${baseUrl}）`);
+      addLog(
+        "info",
+        automatic
+          ? `Picoへ再接続しました（${baseUrl}）`
+          : `PicoにLAN接続しました（${baseUrl}）`,
+      );
     } catch (error) {
-      activeBaseUrlRef.current = "";
+      connectedRef.current = false;
       setConnected(false);
-      addLog("error", error instanceof Error ? error.message : "接続できませんでした");
+      if (!automatic) {
+        addLog("error", error instanceof Error ? error.message : "接続できませんでした");
+      }
     } finally {
+      connectingRef.current = false;
       setConnecting(false);
     }
+  }, [addLog, apiKey, applyStatus, deviceAddress, requestApi]);
+
+  function connect() {
+    setReconnectEnabled(true);
+    void attemptConnection(false);
   }
+
+  useEffect(() => {
+    if (!reconnectEnabled || connected || connecting) return;
+    const timer = window.setTimeout(() => {
+      void attemptConnection(true);
+    }, RECONNECT_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [attemptConnection, connected, connecting, reconnectEnabled]);
 
   useEffect(() => {
     if (!connected) return;
     const timer = window.setInterval(async () => {
+      if (statusPollInFlightRef.current) return;
+      statusPollInFlightRef.current = true;
       try {
         const status = await requestApi("/api/status", {}, true);
         applyStatus(status);
@@ -225,7 +258,12 @@ export default function Home() {
         setConnected(false);
         setDeviceInfo(null);
         setMotors((current) => current.map((motor) => ({ ...motor, running: false })));
-        addLog("error", error instanceof Error ? error.message : "LAN接続が切れました");
+        addLog(
+          "error",
+          `${error instanceof Error ? error.message : "LAN接続が切れました"}。自動再接続します`,
+        );
+      } finally {
+        statusPollInFlightRef.current = false;
       }
     }, 2000);
     return () => window.clearInterval(timer);
@@ -234,6 +272,8 @@ export default function Home() {
   useEffect(() => {
     if (!connected) return;
     const timer = window.setInterval(async () => {
+      if (heartbeatInFlightRef.current || !connectedRef.current) return;
+      heartbeatInFlightRef.current = true;
       const running = motorsRef.current
         .map((motor, index) => ({ motor, index }))
         .filter(({ motor }) => motor.running);
@@ -251,6 +291,8 @@ export default function Home() {
           "error",
           `ウォッチドッグ更新失敗: ${error instanceof Error ? error.message : "通信エラー"}`,
         );
+      } finally {
+        heartbeatInFlightRef.current = false;
       }
     }, HEARTBEAT_MS);
     return () => window.clearInterval(timer);

@@ -48,7 +48,7 @@ target_compile_definitions(pico_lan_stepper PRIVATE
   MAX_SPEED_STEPS_PER_SEC=20000
   MOTOR_API_WATCHDOG_MS=1000
   MOTOR_HOSTNAME="pico-motor"
-  MOTOR_FIRMWARE_VERSION="2026.07.24.3"
+  MOTOR_FIRMWARE_VERSION="2026.07.24.5"
 )
 
 target_link_libraries(pico_lan_stepper

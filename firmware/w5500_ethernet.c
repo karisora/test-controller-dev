@@ -70,8 +70,9 @@
 #define MAX_SPEED_STEPS_PER_SEC 20000
 #endif
 
-#define HTTP_SOCKET 0
-#define DHCP_SOCKET 1
+#define HTTP_SOCKET_FIRST 0u
+#define HTTP_SOCKET_COUNT 4u
+#define DHCP_SOCKET 4u
 #define HTTP_PORT 80
 #define DHCP_BUFFER_SIZE 1024u
 #define DHCP_STARTUP_TIMEOUT_US 15000000u
@@ -86,12 +87,21 @@
 
 static w5500_motor_command_callback_t command_motor;
 static w5500_motor_status_callback_t read_motor_speed;
-static char request_buffer[REQUEST_BUFFER_SIZE];
-static size_t request_length;
-static uint64_t request_started_us;
-static bool response_sent;
-static uint64_t response_sent_us;
-static bool response_queued;
+
+typedef struct {
+    char request_buffer[REQUEST_BUFFER_SIZE];
+    size_t request_length;
+    uint64_t request_started_us;
+    bool response_sent;
+    uint64_t response_sent_us;
+    bool response_queued;
+    uint8_t previous_state;
+    uint64_t state_started_us;
+} http_connection_t;
+
+static http_connection_t http_connections[HTTP_SOCKET_COUNT];
+static uint8_t active_http_socket;
+static http_connection_t *active_http_connection;
 static uint8_t dhcp_buffer[DHCP_BUFFER_SIZE];
 static wiz_NetInfo current_network;
 static uint8_t device_mac[6] = {
@@ -107,8 +117,6 @@ static struct repeating_timer dhcp_timer;
 static bool phy_link_up;
 static bool phy_link_initialized;
 static uint64_t next_phy_link_check_us;
-static uint8_t previous_http_socket_state = 0xffu;
-static uint64_t http_socket_state_started_us;
 
 static bool service_phy_link(void);
 
@@ -400,20 +408,22 @@ static bool queue_http_response(const uint8_t *first, size_t first_length,
                                 const uint8_t *second, size_t second_length)
 {
     size_t total = first_length + second_length;
-    if (total == 0 || total > getSn_TxMAX(HTTP_SOCKET) ||
-        total > getSn_TX_FSR(HTTP_SOCKET)) {
+    if (active_http_connection == NULL || total == 0 ||
+        total > getSn_TxMAX(active_http_socket) ||
+        total > getSn_TX_FSR(active_http_socket)) {
         return false;
     }
 
-    wiz_send_data(HTTP_SOCKET, (uint8_t *)first, (uint16_t)first_length);
+    wiz_send_data(active_http_socket, (uint8_t *)first,
+                  (uint16_t)first_length);
     if (second != NULL && second_length != 0) {
-        wiz_send_data(HTTP_SOCKET, (uint8_t *)second,
+        wiz_send_data(active_http_socket, (uint8_t *)second,
                       (uint16_t)second_length);
     }
-    setSn_CR(HTTP_SOCKET, Sn_CR_SEND);
-    while (getSn_CR(HTTP_SOCKET) != 0) {
+    setSn_CR(active_http_socket, Sn_CR_SEND);
+    while (getSn_CR(active_http_socket) != 0) {
     }
-    response_queued = true;
+    active_http_connection->response_queued = true;
     return true;
 }
 
@@ -597,31 +607,77 @@ static void handle_request(char *request)
               "{\"ok\":false,\"error\":\"endpoint not found\"}");
 }
 
-static void reset_request(void)
+static void reset_request(http_connection_t *connection)
 {
-    request_length = 0;
-    request_started_us = 0;
-    response_sent = false;
-    response_sent_us = 0;
-    response_queued = false;
-    request_buffer[0] = '\0';
+    connection->request_length = 0;
+    connection->request_started_us = 0;
+    connection->response_sent = false;
+    connection->response_sent_us = 0;
+    connection->response_queued = false;
+    connection->request_buffer[0] = '\0';
 }
 
-static void mark_response_sent(void)
+static void mark_response_sent(http_connection_t *connection)
 {
-    request_length = 0;
-    request_started_us = 0;
-    request_buffer[0] = '\0';
-    response_sent = true;
-    response_sent_us = time_us_64();
+    connection->request_length = 0;
+    connection->request_started_us = 0;
+    connection->request_buffer[0] = '\0';
+    connection->response_sent = true;
+    connection->response_sent_us = time_us_64();
 }
 
-static void reset_http_socket(void)
+static void reset_http_socket(uint8_t socket_number,
+                              http_connection_t *connection)
 {
-    close(HTTP_SOCKET);
-    reset_request();
-    previous_http_socket_state = 0xffu;
-    http_socket_state_started_us = time_us_64();
+    // ioLibrary close() waits until Sn_SR becomes CLOSED and can block the
+    // whole Pico for seconds if a browser disappears mid-handshake. W5500's
+    // CLOSE command is immediate, so issue it directly and continue polling.
+    setSn_CR(socket_number, Sn_CR_CLOSE);
+    while (getSn_CR(socket_number) != 0) {
+    }
+    setSn_IR(socket_number, 0xff);
+    reset_request(connection);
+    connection->previous_state = 0xffu;
+    connection->state_started_us = time_us_64();
+}
+
+static bool open_http_socket(uint8_t socket_number)
+{
+    setSn_MR(socket_number, Sn_MR_TCP);
+    setSn_PORT(socket_number, HTTP_PORT);
+    setSn_CR(socket_number, Sn_CR_OPEN);
+    while (getSn_CR(socket_number) != 0) {
+    }
+    return getSn_SR(socket_number) == SOCK_INIT;
+}
+
+static bool listen_http_socket(uint8_t socket_number)
+{
+    setSn_CR(socket_number, Sn_CR_LISTEN);
+    while (getSn_CR(socket_number) != 0) {
+    }
+    return getSn_SR(socket_number) == SOCK_LISTEN;
+}
+
+static void begin_passive_http_disconnect(
+    uint8_t socket_number, http_connection_t *connection)
+{
+    // CLOSE_WAIT means the browser has already sent FIN. Reply with FIN
+    // without calling ioLibrary disconnect(), which waits synchronously.
+    setSn_CR(socket_number, Sn_CR_DISCON);
+    while (getSn_CR(socket_number) != 0) {
+    }
+    reset_request(connection);
+    connection->previous_state = 0xffu;
+    connection->state_started_us = time_us_64();
+}
+
+static void reset_all_http_sockets(void)
+{
+    for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
+        reset_http_socket(HTTP_SOCKET_FIRST + index,
+                          &http_connections[index]);
+    }
 }
 
 static bool service_phy_link(void)
@@ -654,7 +710,7 @@ static bool service_phy_link(void)
             command_motor(MOTOR1_ID, 0);
             command_motor(MOTOR2_ID, 0);
         }
-        reset_http_socket();
+        reset_all_http_sockets();
         stop_dhcp_client();
         if (mdns_started) {
             mdns_responder_stop();
@@ -665,7 +721,7 @@ static bool service_phy_link(void)
     }
 
     printf("LAN link restored\r\n");
-    reset_http_socket();
+    reset_all_http_sockets();
     acquire_network_address();
     if (!mdns_started) {
         mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
@@ -688,7 +744,7 @@ static void service_dhcp(void)
 
     if (apply_dhcp_address()) {
         printf("DHCP address changed to %s\r\n", current_ip_address);
-        reset_http_socket();
+        reset_all_http_sockets();
         if (mdns_started) {
             mdns_responder_stop();
             mdns_started = mdns_responder_init(MOTOR_HOSTNAME);
@@ -701,9 +757,12 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
 {
     command_motor = command_callback;
     read_motor_speed = status_callback;
-    reset_request();
-    previous_http_socket_state = 0xffu;
-    http_socket_state_started_us = 0;
+    active_http_connection = NULL;
+    for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
+        reset_request(&http_connections[index]);
+        http_connections[index].previous_state = 0xffu;
+        http_connections[index].state_started_us = 0;
+    }
     configure_unique_mac();
 
     gpio_init(W5500_CS_PIN);
@@ -753,113 +812,115 @@ bool w5500_ethernet_init(w5500_motor_command_callback_t command_callback,
     return true;
 }
 
-void w5500_ethernet_service(void)
+static void service_http_socket(uint8_t socket_number,
+                                http_connection_t *connection)
 {
-    if (!service_phy_link()) {
-        return;
-    }
-
-    service_dhcp();
-
-    uint8_t state = getSn_SR(HTTP_SOCKET);
+    active_http_socket = socket_number;
+    active_http_connection = connection;
+    uint8_t state = getSn_SR(socket_number);
     uint64_t now = time_us_64();
-    if (state != previous_http_socket_state) {
-        previous_http_socket_state = state;
-        http_socket_state_started_us = now;
+    if (state != connection->previous_state) {
+        connection->previous_state = state;
+        connection->state_started_us = now;
     }
 
     switch (state) {
         case SOCK_CLOSED:
-            reset_request();
-            if (socket(HTTP_SOCKET, Sn_MR_TCP, HTTP_PORT, 0) != HTTP_SOCKET) {
-                reset_http_socket();
+            reset_request(connection);
+            if (!open_http_socket(socket_number)) {
+                reset_http_socket(socket_number, connection);
             }
             break;
         case SOCK_INIT:
-            if (listen(HTTP_SOCKET) != SOCK_OK) {
-                reset_http_socket();
+            if (!listen_http_socket(socket_number)) {
+                reset_http_socket(socket_number, connection);
             }
             break;
         case SOCK_ESTABLISHED: {
-            if (getSn_IR(HTTP_SOCKET) & Sn_IR_CON) {
-                setSn_IR(HTTP_SOCKET, Sn_IR_CON);
-                reset_request();
+            if (getSn_IR(socket_number) & Sn_IR_CON) {
+                setSn_IR(socket_number, Sn_IR_CON);
+                reset_request(connection);
             }
 
-            if (response_sent) {
-                uint8_t interrupts = getSn_IR(HTTP_SOCKET);
+            if (connection->response_sent) {
+                uint8_t interrupts = getSn_IR(socket_number);
                 if (interrupts & Sn_IR_TIMEOUT) {
-                    setSn_IR(HTTP_SOCKET, Sn_IR_TIMEOUT);
-                    reset_http_socket();
+                    setSn_IR(socket_number, Sn_IR_TIMEOUT);
+                    reset_http_socket(socket_number, connection);
                     break;
                 }
                 if (interrupts & Sn_IR_SENDOK) {
-                    setSn_IR(HTTP_SOCKET, Sn_IR_SENDOK);
+                    setSn_IR(socket_number, Sn_IR_SENDOK);
                 }
-                // "Connection: close" makes normal HTTP clients send FIN as
-                // soon as the full Content-Length body is read. Wait for that
-                // passive close; only force-close a client that never leaves.
-                if (now - response_sent_us >= RESPONSE_CLOSE_TIMEOUT_US) {
-                    reset_http_socket();
+                if (now - connection->response_sent_us >=
+                    RESPONSE_CLOSE_TIMEOUT_US) {
+                    reset_http_socket(socket_number, connection);
                 }
                 break;
             }
 
-            uint16_t available = getSn_RX_RSR(HTTP_SOCKET);
+            uint16_t available = getSn_RX_RSR(socket_number);
             if (available != 0) {
-                if (request_started_us == 0) {
-                    request_started_us = time_us_64();
+                if (connection->request_started_us == 0) {
+                    connection->request_started_us = time_us_64();
                 }
-                size_t space = REQUEST_BUFFER_SIZE - 1 - request_length;
+                size_t space =
+                    REQUEST_BUFFER_SIZE - 1 - connection->request_length;
                 uint16_t chunk = available < space ? available : (uint16_t)space;
                 if (chunk == 0) {
                     send_json(413, "Payload Too Large",
                               "{\"ok\":false,\"error\":\"request too large\"}");
-                    if (response_queued) {
-                        mark_response_sent();
+                    if (connection->response_queued) {
+                        mark_response_sent(connection);
                     } else {
-                        reset_http_socket();
+                        reset_http_socket(socket_number, connection);
                     }
                     break;
                 }
                 int32_t received =
-                    recv(HTTP_SOCKET,
-                         (uint8_t *)request_buffer + request_length, chunk);
+                    recv(socket_number,
+                         (uint8_t *)connection->request_buffer +
+                             connection->request_length,
+                         chunk);
                 if (received > 0) {
-                    request_length += (size_t)received;
-                    request_buffer[request_length] = '\0';
+                    connection->request_length += (size_t)received;
+                    connection->request_buffer[connection->request_length] =
+                        '\0';
                 }
             }
 
-            char *header_end = strstr(request_buffer, "\r\n\r\n");
+            char *header_end =
+                strstr(connection->request_buffer, "\r\n\r\n");
             if (header_end != NULL) {
-                size_t header_length = (size_t)(header_end - request_buffer) + 4;
-                size_t content_length = request_content_length(request_buffer);
-                if (request_length >= header_length + content_length) {
-                    handle_request(request_buffer);
-                    if (response_queued) {
-                        mark_response_sent();
+                size_t header_length =
+                    (size_t)(header_end - connection->request_buffer) + 4;
+                size_t content_length =
+                    request_content_length(connection->request_buffer);
+                if (connection->request_length >=
+                    header_length + content_length) {
+                    handle_request(connection->request_buffer);
+                    if (connection->response_queued) {
+                        mark_response_sent(connection);
                     } else {
-                        reset_http_socket();
+                        reset_http_socket(socket_number, connection);
                     }
                 }
             }
-            if (request_started_us != 0 &&
-                time_us_64() - request_started_us > REQUEST_TIMEOUT_US) {
+            if (connection->request_started_us != 0 &&
+                time_us_64() - connection->request_started_us >
+                    REQUEST_TIMEOUT_US) {
                 send_json(408, "Request Timeout",
                           "{\"ok\":false,\"error\":\"request timeout\"}");
-                if (response_queued) {
-                    mark_response_sent();
+                if (connection->response_queued) {
+                    mark_response_sent(connection);
                 } else {
-                    reset_http_socket();
+                    reset_http_socket(socket_number, connection);
                 }
             }
             break;
         }
         case SOCK_CLOSE_WAIT:
-            // The peer has already gone away. A hard close is safe here and
-            // immediately makes socket 0 available for the next browser.
-            reset_http_socket();
+            begin_passive_http_disconnect(socket_number, connection);
             break;
         case SOCK_FIN_WAIT:
         case SOCK_CLOSING:
@@ -869,15 +930,28 @@ void w5500_ethernet_service(void)
         case SOCK_SYNRECV:
             // If the peer vanished during the TCP close handshake, W5500 can
             // otherwise remain in a transitional state and never listen again.
-            if (now - http_socket_state_started_us >= HTTP_CLOSE_TIMEOUT_US) {
-                reset_http_socket();
+            if (now - connection->state_started_us >= HTTP_CLOSE_TIMEOUT_US) {
+                reset_http_socket(socket_number, connection);
             }
             break;
         default:
-            // Socket 0 is reserved for HTTP/TCP. Recover from any corrupt or
-            // unexpected mode instead of leaving the API permanently offline.
-            reset_http_socket();
+            reset_http_socket(socket_number, connection);
             break;
+    }
+    active_http_connection = NULL;
+}
+
+void w5500_ethernet_service(void)
+{
+    if (!service_phy_link()) {
+        return;
+    }
+
+    service_dhcp();
+
+    for (uint8_t index = 0; index < HTTP_SOCKET_COUNT; ++index) {
+        service_http_socket(HTTP_SOCKET_FIRST + index,
+                            &http_connections[index]);
     }
 
     if (mdns_started) {

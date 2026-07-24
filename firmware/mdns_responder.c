@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define MDNS_SOCKET 2
+#define MDNS_SOCKET 5
 #define MDNS_PORT 5353u
 #define MDNS_BUFFER_SIZE 512u
 #define MDNS_TTL_SECONDS 120u
